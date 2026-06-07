@@ -11,11 +11,25 @@ function normalizePaymentMethod(paymentMethod) {
   return String(paymentMethod || '').trim().toUpperCase();
 }
 
+function buildFailureReasonSelect(capabilities, alias = 'o') {
+  return hasColumn(capabilities?.orderColumns || new Set(), 'failure_reason')
+    ? `${alias}.failure_reason`
+    : 'NULL AS failure_reason';
+}
+
+function buildOrderPaymentSelect(capabilities, alias = 'o') {
+  const columns = capabilities?.orderColumns || new Set();
+  return [
+    hasColumn(columns, 'order_code') ? `${alias}.order_code` : `CONCAT(N'#', ${alias}.id) AS order_code`,
+    hasColumn(columns, 'payment_status') ? `${alias}.payment_status` : 'NULL AS payment_status',
+  ].join(', ');
+}
+
 function formatPaymentMethodLabel(paymentMethod) {
   const method = normalizePaymentMethod(paymentMethod);
   if (method === 'COD') return 'Thanh toán khi nhận hàng';
-  if (method === 'MOMO') return 'Ví MoMo';
-  if (method === 'ZALOPAY') return 'ZaloPay';
+  if (method === 'MOMO') return 'MoMo UAT';
+  if (method === 'ZALOPAY') return 'ZaloPay Sandbox';
   if (method === 'VNPAY') return 'VNPay';
   if (method === 'BANKING') return 'Chuyển khoản ngân hàng';
   if (method === 'CREDITCARD') return 'Thẻ ngân hàng';
@@ -60,8 +74,6 @@ function buildOrderFilters({
   if (status) {
     conditions.push('o.status = ?');
     params.push(String(status));
-  } else {
-    conditions.push("UPPER(ISNULL(o.status, '')) NOT IN ('PENDING_PAYMENT', 'PAYMENT_FAILED', 'CANCELLED_PAYMENT')");
   }
   if (paymentMethod) {
     conditions.push('o.payment_method = ?');
@@ -121,6 +133,7 @@ export async function listAdminOrders({
   const safePage = Math.max(1, Number(page));
   const safePageSize = Math.max(1, Math.min(100, Number(pageSize)));
   const offset = (safePage - 1) * safePageSize;
+  const capabilities = await getCheckoutStorageCapabilities();
 
   const conditions = [];
   const params = [];
@@ -132,8 +145,6 @@ export async function listAdminOrders({
   if (status) {
     conditions.push('o.status = ?');
     params.push(String(status));
-  } else {
-    conditions.push("UPPER(ISNULL(o.status, '')) NOT IN ('PENDING_PAYMENT', 'PAYMENT_FAILED', 'CANCELLED_PAYMENT')");
   }
   if (paymentMethod) {
     conditions.push('o.payment_method = ?');
@@ -169,7 +180,7 @@ export async function listAdminOrders({
             SUM(CASE WHEN UPPER(o.status) IN ('PENDING', 'CONFIRMED') THEN 1 ELSE 0 END) AS awaiting,
             SUM(CASE WHEN UPPER(o.status) IN ('PACKING', 'SHIPPING') THEN 1 ELSE 0 END) AS processing,
             SUM(CASE WHEN UPPER(o.status) IN ('DELIVERED', 'COMPLETED') THEN 1 ELSE 0 END) AS completed,
-            SUM(CASE WHEN UPPER(o.status) IN ('PAYMENT_FAILED', 'CANCELLED_PAYMENT', 'CANCELLED', 'REFUNDED') THEN 1 ELSE 0 END) AS cancelled
+            SUM(CASE WHEN UPPER(o.status) IN ('PAYMENT_REJECTED', 'PAYMENT_FAILED', 'CANCELLED_PAYMENT', 'CANCELLED', 'REFUNDED') THEN 1 ELSE 0 END) AS cancelled
      FROM orders o
      LEFT JOIN users u ON u.id = o.user_id
      ${whereSql}`,
@@ -229,6 +240,8 @@ export async function listAdminOrders({
 
   const rows = await query(
     `SELECT o.id, o.user_id, o.total, o.payment_method, o.status, o.created_at,
+            ${buildOrderPaymentSelect(capabilities, 'o')},
+            ${buildFailureReasonSelect(capabilities, 'o')},
             COALESCE(u.name, N'Khách vãng lai') AS user_name
      FROM orders o
      LEFT JOIN users u ON u.id = o.user_id
@@ -241,12 +254,15 @@ export async function listAdminOrders({
   return {
     listOrders: rows.map((r) => ({
       id: r.id,
+      orderCode: r.order_code || `#${r.id}`,
       userId: r.user_id,
       userName: r.user_name,
       total: Number(r.total || 0),
       paymentMethod: r.payment_method,
       paymentMethodLabel: formatPaymentMethodLabel(r.payment_method),
+      paymentStatus: r.payment_status || '',
       status: normalizeOrderStatus(r.status),
+      failureReason: r.failure_reason || '',
       createdAt: r.created_at,
     })),
     currentOrderPage: safePage,
@@ -287,6 +303,7 @@ export async function getAdminOrderAnalytics({
   dateTo = null,
   search = null,
 } = {}) {
+  const capabilities = await getCheckoutStorageCapabilities();
   const { whereSql, conditions, params } = buildOrderFilters({
     userId,
     status,
@@ -307,7 +324,7 @@ export async function getAdminOrderAnalytics({
             SUM(CASE WHEN UPPER(o.status) IN ('PENDING', 'CONFIRMED') THEN 1 ELSE 0 END) AS awaiting,
               SUM(CASE WHEN UPPER(o.status) IN ('PACKING', 'SHIPPING') THEN 1 ELSE 0 END) AS processing,
               SUM(CASE WHEN UPPER(o.status) IN ('DELIVERED', 'COMPLETED') THEN 1 ELSE 0 END) AS completed,
-              SUM(CASE WHEN UPPER(o.status) IN ('PAYMENT_FAILED', 'CANCELLED_PAYMENT', 'CANCELLED', 'REFUNDED') THEN 1 ELSE 0 END) AS cancelled
+              SUM(CASE WHEN UPPER(o.status) IN ('PAYMENT_REJECTED', 'PAYMENT_FAILED', 'CANCELLED_PAYMENT', 'CANCELLED', 'REFUNDED') THEN 1 ELSE 0 END) AS cancelled
        FROM orders o
        LEFT JOIN users u ON u.id = o.user_id
        ${whereSql}`,
@@ -348,6 +365,7 @@ export async function getAdminOrderAnalytics({
     ),
     query(
       `SELECT TOP 8 o.id, o.user_id, o.total, o.payment_method, o.status, o.created_at,
+              ${buildOrderPaymentSelect(capabilities, 'o')},
               COALESCE(u.name, N'Khách vãng lai') AS customer_name,
               COALESCE(u.email, '') AS customer_email
        FROM orders o
@@ -393,7 +411,7 @@ export async function getAdminOrderAnalytics({
     })),
     recentOrders: recentRows.map((row) => ({
       id: row.id,
-      orderCode: formatOrderCode(row.id),
+      orderCode: row.order_code || `#${row.id}`,
       userId: row.user_id,
       customerName: row.customer_name,
       customerEmail: row.customer_email,
@@ -410,6 +428,8 @@ export async function getAdminOrderById(orderId) {
   const capabilities = await getCheckoutStorageCapabilities();
   const rows = await query(
     `SELECT o.id, o.user_id, o.total, o.payment_method, o.status, o.created_at,
+            ${buildOrderPaymentSelect(capabilities, 'o')},
+            ${buildFailureReasonSelect(capabilities, 'o')},
             COALESCE(u.name, N'Khách vãng lai') AS user_name,
             COALESCE(u.email, '') AS user_email,
             o.shipping_address, o.phone
@@ -458,11 +478,14 @@ export async function getAdminOrderById(orderId) {
 
   return {
     id: order.id,
+    orderCode: order.order_code || `#${order.id}`,
     userId: order.user_id,
     total: Number(order.total || 0),
     paymentMethod: order.payment_method,
     paymentMethodLabel: formatPaymentMethodLabel(order.payment_method),
+    paymentStatus: order.payment_status || '',
     status: normalizeOrderStatus(order.status),
+    failureReason: order.failure_reason || '',
     createdAt: order.created_at,
     userName: order.user_name,
     userEmail: order.user_email,
@@ -489,7 +512,7 @@ export async function getAdminOrderById(orderId) {
 
 export async function updateAdminOrderStatus(orderId, status, { changedBy = null, note = null } = {}) {
   const normalizedStatus = normalizeOrderStatus(status);
-  if ([ORDER_STATUS.PAYMENT_FAILED, ORDER_STATUS.CANCELLED_PAYMENT, ORDER_STATUS.CANCELLED, ORDER_STATUS.REFUNDED].includes(normalizedStatus)) {
+  if ([ORDER_STATUS.PAYMENT_REJECTED, ORDER_STATUS.PAYMENT_FAILED, ORDER_STATUS.CANCELLED_PAYMENT, ORDER_STATUS.CANCELLED, ORDER_STATUS.REFUNDED].includes(normalizedStatus)) {
     const result = await cancelOrderForAdmin(orderId, {
       targetStatus: normalizedStatus,
       changedBy,

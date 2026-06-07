@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import api from '../services/api';
 import { AdminStatusBadge, formatAdminCurrency, formatAdminDate } from '../components/Admin/AdminUi';
-import { formatPaymentMethodLabel } from '../utils/formatters';
+import { formatPaymentMethodLabel, formatPaymentStatusLabel } from '../utils/formatters';
 
 function unwrapApiData(payload) {
   return payload && typeof payload === 'object' && 'data' in payload ? payload.data : payload;
@@ -50,7 +50,9 @@ export function AdminOrderDetailPage() {
           <div><strong>Ngày đặt:</strong> {formatAdminDate(order.createdAt)}</div>
           <div><strong>Tổng tiền:</strong> {formatAdminCurrency(order.total)}</div>
           <div><strong>Thanh toán:</strong> {order.paymentMethodLabel || formatPaymentMethodLabel(order.paymentMethod)}</div>
+          {order.paymentStatus && <div><strong>Trạng thái thanh toán:</strong> {formatPaymentStatusLabel(order.paymentStatus)}</div>}
           <div><strong>Trạng thái:</strong> <AdminStatusBadge status={order.status} /></div>
+          {order.failureReason && <div className="wide"><strong>Lý do thanh toán:</strong> {order.failureReason}</div>}
           <div><strong>SĐT:</strong> {order.phone || '-'}</div>
           <div className="wide"><strong>Địa chỉ:</strong> {order.shippingAddress || '-'}</div>
         </section>

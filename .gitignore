@@ -21,6 +21,9 @@ Thumbs.db
 # Local runtime state and startup logs
 .runtime/
 .codex-screens/
+.codex-doc-review/
+docx-render-check/
+demo-payment-master/
 .chrome-*/
 *.out.log
 *.err.log

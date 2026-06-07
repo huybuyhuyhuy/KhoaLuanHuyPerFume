@@ -287,6 +287,11 @@ function activeVariantFilter(capabilities, alias = 'pv') {
   return filters.length ? ` AND ${filters.join(' AND ')}` : '';
 }
 
+function importableVariantFilter(capabilities, alias = 'pv') {
+  if (!hasColumn(capabilities.variantColumns, 'variant_type')) return '';
+  return ` AND UPPER(ISNULL(${alias}.variant_type, N'FULL')) <> N'DECANT'`;
+}
+
 async function getSupplierForReceipt(transaction, supplierId) {
   const result = await txQuery(
     transaction,
@@ -326,7 +331,7 @@ async function getVariantForReceipt(transaction, productId, variantId, capabilit
     transaction,
     `SELECT TOP 1 pv.id, pv.product_id, pv.stock_quantity, ${labelSelect} AS volume_label, ${typeSelect} AS variant_type
      FROM dbo.product_variants pv WITH (UPDLOCK, HOLDLOCK)
-     WHERE pv.id = @variantId AND pv.product_id = @productId${activeVariantFilter(capabilities, 'pv')}`,
+     WHERE pv.id = @variantId AND pv.product_id = @productId${activeVariantFilter(capabilities, 'pv')}${importableVariantFilter(capabilities, 'pv')}`,
     [
       { name: 'variantId', value: variantId, type: sql.Int },
       { name: 'productId', value: productId, type: sql.Int },
@@ -350,7 +355,25 @@ async function increaseStock(transaction, item, capabilities) {
         { name: 'productId', value: item.productId, type: sql.Int },
       ]
     );
-    return result.recordset?.[0] || null;
+    const variantStock = result.recordset?.[0] || null;
+    if (!variantStock) return null;
+
+    const stockColumn = productStockColumn(capabilities);
+    const updates = [`${stockColumn} = ${stockColumn} + @quantity`];
+    if (stockColumn !== 'stock' && hasColumn(capabilities.productColumns, 'stock')) updates.push('stock = stock + @quantity');
+    if (stockColumn !== 'quantity' && hasColumn(capabilities.productColumns, 'quantity')) updates.push('quantity = quantity + @quantity');
+    if (hasColumn(capabilities.productColumns, 'updated_at')) updates.push('updated_at = SYSDATETIME()');
+    await txQuery(
+      transaction,
+      `UPDATE dbo.products
+       SET ${updates.join(', ')}
+       WHERE id = @productId`,
+      [
+        { name: 'quantity', value: item.quantity, type: sql.Int },
+        { name: 'productId', value: item.productId, type: sql.Int },
+      ]
+    );
+    return variantStock;
   }
 
   const stockColumn = productStockColumn(capabilities);
@@ -388,7 +411,25 @@ async function decreaseStock(transaction, item, capabilities) {
         { name: 'productId', value: item.productId, type: sql.Int },
       ]
     );
-    return result.recordset?.[0] || null;
+    const variantStock = result.recordset?.[0] || null;
+    if (!variantStock) return null;
+
+    const stockColumn = productStockColumn(capabilities);
+    const updates = [`${stockColumn} = ${stockColumn} - @quantity`];
+    if (stockColumn !== 'stock' && hasColumn(capabilities.productColumns, 'stock')) updates.push('stock = stock - @quantity');
+    if (stockColumn !== 'quantity' && hasColumn(capabilities.productColumns, 'quantity')) updates.push('quantity = quantity - @quantity');
+    if (hasColumn(capabilities.productColumns, 'updated_at')) updates.push('updated_at = SYSDATETIME()');
+    await txQuery(
+      transaction,
+      `UPDATE dbo.products
+       SET ${updates.join(', ')}
+       WHERE id = @productId AND ${stockColumn} >= @quantity`,
+      [
+        { name: 'quantity', value: item.quantity, type: sql.Int },
+        { name: 'productId', value: item.productId, type: sql.Int },
+      ]
+    );
+    return variantStock;
   }
 
   const stockColumn = productStockColumn(capabilities);
@@ -947,6 +988,7 @@ export async function listReceiptProductOptions({ search = '', limit = 100 } = {
     const variantFilters = ['product_id IN (' + placeholders + ')'];
     if (hasColumn(capabilities.variantColumns, 'deleted_at')) variantFilters.push('deleted_at IS NULL');
     if (hasColumn(capabilities.variantColumns, 'status')) variantFilters.push('ISNULL(status, 1) = 1');
+    if (hasColumn(capabilities.variantColumns, 'variant_type')) variantFilters.push("UPPER(ISNULL(variant_type, N'FULL')) <> N'DECANT'");
     const volumeLabelSelect = hasColumn(capabilities.variantColumns, 'volume_label') ? 'volume_label' : 'NULL AS volume_label';
     const variantTypeSelect = hasColumn(capabilities.variantColumns, 'variant_type') ? 'variant_type' : 'NULL AS variant_type';
     const sortSelect = hasColumn(capabilities.variantColumns, 'sort_order') ? 'sort_order' : '0 AS sort_order';

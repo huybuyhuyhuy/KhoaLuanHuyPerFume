@@ -955,6 +955,12 @@
   letter-spacing: 0.08em;
   text-transform: uppercase;
 }
+.admin-receipt-stock-preview {
+  color: #8a6a38;
+  font-size: 0.75rem;
+  font-weight: 700;
+  line-height: 1.35;
+}
 .admin-receipt-form-grid .form-control,
 .admin-receipt-form-grid .form-select,
 .admin-receipt-item-row .form-control,

@@ -7,11 +7,12 @@ import { getAuthStorageCapabilities, hasColumn } from '../auth/auth.storage.js';
 const LOW_STOCK_THRESHOLD = env.lowStockThreshold;
 
 async function getDashboardCapabilities() {
-  const [product, auth] = await Promise.all([
+  const [product, auth, orderColumns] = await Promise.all([
     getProductStorageCapabilities(),
     getAuthStorageCapabilities(),
+    tableColumns('orders'),
   ]);
-  return { product, userColumns: auth.userColumns };
+  return { product, userColumns: auth.userColumns, orderColumns };
 }
 
 function activeProductCondition(capabilities, alias = 'p') {
@@ -705,8 +706,13 @@ export async function fetchTopCategories(limit, start, end) {
 }
 
 export async function fetchRecentOrders(limit) {
+  const { orderColumns } = await getDashboardCapabilities();
+  const orderCodeSelect = hasColumn(orderColumns, 'order_code')
+    ? "COALESCE(NULLIF(o.order_code, N''), CONCAT(N'#', o.id)) AS order_code"
+    : "CONCAT(N'#', o.id) AS order_code";
   return query(
     `SELECT TOP ${Number(limit)} o.id, o.total, o.status, o.payment_method, o.created_at,
+            ${orderCodeSelect},
             COALESCE(u.name, N'Khách vãng lai') AS customer_name,
             COALESCE(u.email, '') AS customer_email
      FROM orders o

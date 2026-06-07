@@ -14,6 +14,16 @@
       "problemMatcher": []
     },
     {
+      "label": "Stop Backend API Port",
+      "type": "shell",
+      "command": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"${workspaceFolder}\\scripts\\windows\\stop-api-port.ps1\"",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "silent",
+        "panel": "dedicated"
+      }
+    },
+    {
       "label": "Start React User Frontend",
       "type": "shell",
       "command": "npm.cmd run dev:user --prefix frontend",

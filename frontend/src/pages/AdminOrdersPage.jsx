@@ -288,7 +288,7 @@ export function AdminOrdersPage() {
                 <tbody>
                   {orders.map((order) => (
                     <tr key={order.id}>
-                      <td><strong>#{order.id}</strong></td>
+                      <td><strong>{order.orderCode || `#${order.id}`}</strong></td>
                       <td>{order.userName || '-'}</td>
                       <td><strong>{formatAdminCurrency(order.total)}</strong></td>
                       <td>{order.paymentMethodLabel || formatPaymentMethodLabel(order.paymentMethod)}</td>

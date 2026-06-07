@@ -2,7 +2,8 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { orderService } from '../services/orderService';
 import { useToast } from '../store/ToastContext';
-import { formatPaymentMethodLabel, formatVnCurrency } from '../utils/formatters';
+import { savePaymentAuthBridge } from '../utils/paymentAuthBridge';
+import { formatPaymentMethodLabel, formatPaymentStatusLabel, formatVnCurrency } from '../utils/formatters';
 import { resolveProductImage } from '../utils/image';
 import {
   ORDER_STATUS,
@@ -16,6 +17,7 @@ import {
 
 const ORDER_REFRESH_INTERVAL_MS = 5000;
 const TERMINAL_ORDER_STATUSES = [
+  ORDER_STATUS.PAYMENT_REJECTED,
   ORDER_STATUS.PAYMENT_FAILED,
   ORDER_STATUS.CANCELLED_PAYMENT,
   ORDER_STATUS.CANCELLED,
@@ -38,7 +40,7 @@ function getOrderItemLabel(item) {
 function OrderProgress({ order }) {
   const activeStep = getOrderTimelineIndex(order.status, order.timeline);
   const normalizedStatus = normalizeOrderStatus(order.status);
-  const terminalStatus = [ORDER_STATUS.CANCELLED, ORDER_STATUS.REFUNDED].includes(normalizedStatus);
+  const terminalStatus = [ORDER_STATUS.PAYMENT_REJECTED, ORDER_STATUS.PAYMENT_FAILED, ORDER_STATUS.CANCELLED_PAYMENT, ORDER_STATUS.CANCELLED, ORDER_STATUS.REFUNDED].includes(normalizedStatus);
 
   return (
     <section className="luxury-surface order-detail-progress">
@@ -63,7 +65,9 @@ function OrderProgress({ order }) {
       </div>
       {terminalStatus && (
         <p className="order-detail-terminal">
-          Đơn hàng đã {normalizedStatus === ORDER_STATUS.REFUNDED ? 'được hoàn tiền' : 'bị hủy'}.
+          {normalizedStatus === ORDER_STATUS.PAYMENT_REJECTED
+            ? 'Thanh toán MoMo UAT bị từ chối bởi phương thức thanh toán test.'
+            : `Đơn hàng đã ${normalizedStatus === ORDER_STATUS.REFUNDED ? 'được hoàn tiền' : 'bị hủy'}.`}
         </p>
       )}
       {Array.isArray(order.timeline) && order.timeline.length > 0 && (
@@ -87,6 +91,7 @@ export function OrderDetailPage() {
   const [order, setOrder] = useState(null);
   const [loading, setLoading] = useState(true);
   const [cancelling, setCancelling] = useState(false);
+  const [retryingPayment, setRetryingPayment] = useState('');
   const [error, setError] = useState('');
   const latestStatusRef = useRef('');
 
@@ -155,6 +160,32 @@ export function OrderDetailPage() {
     }
   };
 
+  const canRetryPayment = (() => {
+    if (!order) return false;
+    const status = normalizeOrderStatus(order.status);
+    const paymentStatus = String(order.paymentStatus || '').toUpperCase();
+    if (paymentStatus === 'PAID' || paymentStatus === 'CANCELLED') return false;
+    if ([ORDER_STATUS.CANCELLED_PAYMENT, ORDER_STATUS.CANCELLED, ORDER_STATUS.REFUNDED, ORDER_STATUS.CONFIRMED, ORDER_STATUS.COMPLETED].includes(status)) return false;
+    return [ORDER_STATUS.PENDING_PAYMENT, ORDER_STATUS.PENDING].includes(status);
+  })();
+
+  const handleRetryPayment = async (provider) => {
+    if (!order) return;
+    setRetryingPayment(provider);
+    try {
+      savePaymentAuthBridge();
+      const paymentResponse = provider === 'MOMO'
+        ? await orderService.createMomoPayment(order.id)
+        : await orderService.createZaloPayPayment(order.id);
+      const paymentUrl = paymentResponse?.paymentUrl || paymentResponse?.payUrl || paymentResponse?.orderUrl || paymentResponse?.deeplink || '';
+      if (!paymentUrl) throw new Error('Không tạo được link thanh toán.');
+      window.location.href = paymentUrl;
+    } catch (requestError) {
+      pushToast(requestError?.response?.data?.message || requestError?.message || 'Không thể tạo lại thanh toán lúc này.', 'error');
+      setRetryingPayment('');
+    }
+  };
+
   if (loading) return <div className="text-center py-5"><div className="spinner-border" /></div>;
 
   if (error) {
@@ -174,9 +205,19 @@ export function OrderDetailPage() {
         <header className="order-detail-header">
           <div>
             <p className="section-eyebrow">Đơn hàng của bạn</p>
-            <h1>Chi tiết đơn hàng #{order.id}</h1>
+            <h1>Chi tiết đơn hàng {order.orderCode || `#${order.id}`}</h1>
           </div>
           <div className="d-flex gap-2">
+            {canRetryPayment && (
+              <>
+                <button type="button" className="btn btn-dark btn-sm" disabled={Boolean(retryingPayment)} onClick={() => handleRetryPayment('MOMO')}>
+                  {retryingPayment === 'MOMO' ? 'Đang tạo link...' : 'Thanh toán lại MoMo UAT'}
+                </button>
+                <button type="button" className="btn btn-outline-dark btn-sm" disabled={Boolean(retryingPayment)} onClick={() => handleRetryPayment('ZALOPAY')}>
+                  {retryingPayment === 'ZALOPAY' ? 'Đang tạo link...' : 'Thanh toán ZaloPay Sandbox'}
+                </button>
+              </>
+            )}
             {canCancelOrder(order.status) && (
               <button type="button" className="btn btn-outline-danger btn-sm" disabled={cancelling} onClick={handleCancel}>
                 {cancelling ? 'Đang hủy...' : 'Hủy đơn'}
@@ -191,7 +232,9 @@ export function OrderDetailPage() {
         <section className="luxury-surface order-detail-information">
           <div><strong>Ngày đặt:</strong> {new Date(order.createdAt).toLocaleString('vi-VN')}</div>
           <div><strong>Thanh toán:</strong> {order.paymentMethodLabel || formatPaymentMethodLabel(order.paymentMethod)}</div>
+          {order.paymentStatus && <div><strong>Trạng thái thanh toán:</strong> {formatPaymentStatusLabel(order.paymentStatus)}</div>}
           <div><strong>Trạng thái:</strong> <StatusBadge status={order.status} /></div>
+          {order.failureReason && <div className="wide"><strong>Lý do thanh toán:</strong> {order.failureReason}</div>}
           <div><strong>SĐT giao hàng:</strong> {order.phone || '-'}</div>
           <div className="wide"><strong>Địa chỉ:</strong> {order.shippingAddress || '-'}</div>
         </section>

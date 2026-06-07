@@ -171,6 +171,7 @@ export interface OrderStatusHistoryItem {
 
 export interface OrderResponse {
   id: number;
+  orderCode?: string;
   userId: number;
   userName: string;
   total: number;
@@ -184,9 +185,11 @@ export interface OrderResponse {
   phone: string;
   paymentMethod: string;
   paymentMethodLabel?: string;
+  paymentStatus?: string;
   momoOrderId: string;
   momoTransId: string;
   zalopayAppTransId: string;
+  failureReason?: string;
   status: string;
   createdAt: string;
   items: OrderItemInfo[];

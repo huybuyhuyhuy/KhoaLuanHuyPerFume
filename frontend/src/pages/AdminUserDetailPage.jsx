@@ -131,7 +131,7 @@ export function AdminUserDetailPage() {
               {(data.recentOrders || []).map((order) => (
                 <article key={order.id} className="admin-list-item">
                   <div>
-                    <strong>#{order.code || order.id}</strong>
+                    <strong>{order.orderCode || order.order_code || order.code || `#${order.id}`}</strong>
                     <small>{formatAdminDate(order.created_at)}</small>
                   </div>
                   <div>

@@ -7,14 +7,15 @@ import { addressService, formatAddress } from '../services/addressService';
 import { voucherService } from '../services/voucherService';
 import { clearCartVoucher, readCartVoucher, saveCartVoucher } from '../utils/cartVoucherStorage';
 import { savePaymentAuthBridge } from '../utils/paymentAuthBridge';
+import { clearPendingPaymentReturn, savePendingPaymentReturn } from '../utils/pendingPaymentReturn';
 import { resolveProductImage } from '../utils/image';
 import { formatVnCurrency } from '../utils/formatters';
 import { siteContact } from '../config/siteConfig';
 
 const paymentMethods = [
   { value: 'COD', label: 'Thanh toán khi nhận hàng', note: 'Phù hợp khi bạn muốn kiểm tra kiện hàng trước.' },
-  { value: 'MOMO', label: 'Ví MoMo', note: 'Chuyển sang cổng MoMo sau khi tạo đơn.' },
-  { value: 'ZALOPAY', label: 'ZaloPay', note: 'Chuyển sang cổng ZaloPay sau khi tạo đơn.' },
+  { value: 'MOMO', label: 'MoMo UAT', note: 'Cổng test có thể từ chối thẻ ATM UAT; mỗi lần thử sẽ tạo link mới.' },
+  { value: 'ZALOPAY', label: 'ZaloPay Sandbox', note: 'Ưu tiên dùng khi demo chính nếu MoMo UAT bị từ chối.' },
 ];
 
 const emptyShippingForm = {
@@ -257,10 +258,16 @@ export function CheckoutPage() {
         const paymentResponse = await orderService.createZaloPayPayment(order.id);
         const paymentUrl = paymentResponse?.paymentUrl || paymentResponse?.orderUrl;
         if (!paymentUrl) throw new Error('Không tạo được link thanh toán ZaloPay');
+        const appTransId = paymentResponse?.appTransId || paymentResponse?.zalopayAppTransId || '';
+        savePendingPaymentReturn({
+          paymentMethod: 'ZALOPAY',
+          orderId: order.id,
+          externalOrderId: appTransId,
+        });
         setZaloPayment({
           orderId: order.id,
           paymentUrl,
-          appTransId: paymentResponse?.appTransId || paymentResponse?.zalopayAppTransId || '',
+          appTransId,
           gatewayOpened: false,
         });
         return;
@@ -292,6 +299,11 @@ export function CheckoutPage() {
     if (!zaloPayment?.paymentUrl) return;
     setZaloPayment((current) => current ? { ...current, gatewayOpened: true } : current);
     savePaymentAuthBridge();
+    savePendingPaymentReturn({
+      paymentMethod: 'ZALOPAY',
+      orderId: zaloPayment.orderId,
+      externalOrderId: zaloPayment.appTransId || '',
+    });
     window.location.href = zaloPayment.paymentUrl;
   };
 
@@ -306,6 +318,7 @@ export function CheckoutPage() {
   const closeZaloGateway = () => {
     const payment = zaloPayment;
     setZaloPayment(null);
+    if (!payment?.gatewayOpened) clearPendingPaymentReturn();
     if (payment?.orderId && !payment.gatewayOpened) {
       orderService.cancelOrder(payment.orderId, 'Khách đóng popup ZaloPay trước khi mở cổng thanh toán').catch(() => undefined);
     }
@@ -459,7 +472,7 @@ export function CheckoutPage() {
             <button className="btn luxury-primary-btn w-100" disabled={loading} onClick={handleCheckout}>
               {loading ? 'Đang xử lý...' : 'Đặt hàng'}
             </button>
-            <p className="luxury-summary-note">Đơn COD sẽ được tạo ngay. Với MoMo/ZaloPay, hệ thống sẽ chuyển sang cổng thanh toán sau bước này.</p>
+            <p className="luxury-summary-note">Đơn COD sẽ được tạo ngay. Với MoMo UAT/ZaloPay Sandbox, hệ thống sẽ chuyển sang cổng thanh toán sau bước này.</p>
           </aside>
         </div>
       </div>
@@ -468,18 +481,18 @@ export function CheckoutPage() {
         <div className="momo-qr-overlay" role="dialog" aria-modal="true" aria-labelledby="momo-qr-title" onClick={closeMomoGateway}>
           <div className="momo-qr-modal luxury-surface" onClick={(event) => event.stopPropagation()}>
             <button type="button" className="momo-qr-close" aria-label="Đóng" onClick={closeMomoGateway}>×</button>
-            <p className="section-eyebrow">Thanh toán MoMo</p>
-            <h2 id="momo-qr-title">Sẵn sàng chuyển sang MoMo</h2>
-            <p className="momo-qr-description">Cổng thanh toán MoMo đã được tạo cho đơn hàng này. Bấm nút bên dưới để tiếp tục thanh toán trên MoMo.</p>
+            <p className="section-eyebrow">Thanh toán MoMo UAT</p>
+            <h2 id="momo-qr-title">Sẵn sàng chuyển sang MoMo UAT</h2>
+            <p className="momo-qr-description">Cổng thanh toán MoMo UAT đã được tạo cho đơn hàng này. Nếu thẻ test bị từ chối, vui lòng tạo đơn mới hoặc chọn ZaloPay Sandbox/COD.</p>
             <div className="momo-gateway-card">
-              <span>MoMo Gateway</span>
+              <span>MoMo UAT</span>
               <strong>Đơn #{momoPayment.orderId}</strong>
-              <small>Không cần quét mã QR.</small>
+              <small>Mỗi lần mở là một payUrl mới từ MoMo.</small>
             </div>
             <div className="momo-qr-actions">
               {momoPayment.paymentUrl && (
                 <button type="button" className="btn luxury-primary-btn" onClick={openMomoGateway}>
-                  Mở cổng MoMo
+                  Mở cổng MoMo UAT
                 </button>
               )}
               <button type="button" className="btn luxury-secondary-btn" onClick={closeMomoGateway}>
@@ -494,18 +507,18 @@ export function CheckoutPage() {
         <div className="momo-qr-overlay" role="dialog" aria-modal="true" aria-labelledby="zalo-gateway-title" onClick={closeZaloGateway}>
           <div className="momo-qr-modal luxury-surface" onClick={(event) => event.stopPropagation()}>
             <button type="button" className="momo-qr-close" aria-label="Đóng" onClick={closeZaloGateway}>×</button>
-            <p className="section-eyebrow">Thanh toán ZaloPay</p>
-            <h2 id="zalo-gateway-title">Sẵn sàng chuyển sang ZaloPay</h2>
-            <p className="momo-qr-description">Cổng thanh toán ZaloPay đã được tạo cho đơn hàng này. Bấm nút bên dưới để tiếp tục thanh toán trên ZaloPay.</p>
+            <p className="section-eyebrow">Thanh toán ZaloPay Sandbox</p>
+            <h2 id="zalo-gateway-title">Sẵn sàng chuyển sang ZaloPay Sandbox</h2>
+            <p className="momo-qr-description">Cổng thanh toán ZaloPay Sandbox đã được tạo cho đơn hàng này. Đây là lựa chọn ưu tiên cho demo chính.</p>
             <div className="momo-gateway-card">
-              <span>ZaloPay Gateway</span>
+              <span>ZaloPay Sandbox</span>
               <strong>Đơn #{zaloPayment.orderId}</strong>
               <small>Không cần quét mã QR.</small>
             </div>
             <div className="momo-qr-actions">
               {zaloPayment.paymentUrl && (
                 <button type="button" className="btn luxury-primary-btn" onClick={openZaloGateway}>
-                  Mở cổng ZaloPay
+                  Mở cổng ZaloPay Sandbox
                 </button>
               )}
               <button type="button" className="btn luxury-secondary-btn" onClick={closeZaloGateway}>

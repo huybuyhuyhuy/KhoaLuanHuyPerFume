@@ -17,7 +17,7 @@ function inventoryShortage(message) {
 
 let decantInventoryReadyPromise = null;
 
-async function ensureDecantInventoryTables() {
+export async function ensureDecantInventoryTables() {
   if (!decantInventoryReadyPromise) {
     decantInventoryReadyPromise = query(`
       IF OBJECT_ID(N'dbo.product_inventory', N'U') IS NULL
@@ -77,22 +77,13 @@ async function ensureDecantInventoryTables() {
       IF COL_LENGTH(N'dbo.inventory_movements', N'admin_id') IS NULL
         ALTER TABLE dbo.inventory_movements ADD admin_id INT NULL;
 
-      IF EXISTS (
-        SELECT 1 FROM sys.check_constraints
-        WHERE name = N'CK_inventory_movements_type'
-          AND parent_object_id = OBJECT_ID(N'dbo.inventory_movements')
-      )
-      BEGIN
-        ALTER TABLE dbo.inventory_movements DROP CONSTRAINT CK_inventory_movements_type;
-      END
-
       IF NOT EXISTS (
         SELECT 1 FROM sys.check_constraints
         WHERE name = N'CK_inventory_movements_type'
           AND parent_object_id = OBJECT_ID(N'dbo.inventory_movements')
       )
       BEGIN
-        ALTER TABLE dbo.inventory_movements WITH CHECK ADD CONSTRAINT CK_inventory_movements_type
+        ALTER TABLE dbo.inventory_movements WITH NOCHECK ADD CONSTRAINT CK_inventory_movements_type
         CHECK (movement_type IN (
           N'BOTTLE_OPEN', N'DECANT_SALE', N'DECANT_SOLD', N'BOTTLE_SALE',
           N'BOTTLE_RESTOCK', N'DECANT_RESTOCK', N'RETURN_RESTOCK',
@@ -284,7 +275,7 @@ async function insertMovement(transaction, entry) {
 }
 
 export async function recordDecantMovement(transaction, entry) {
-  await ensureDecantInventoryTables();
+  if (!transaction) await ensureDecantInventoryTables();
   return insertMovement(transaction, entry);
 }
 

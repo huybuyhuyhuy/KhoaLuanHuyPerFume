@@ -8,6 +8,7 @@
       "cwd": "${workspaceFolder}/backend",
       "runtimeExecutable": "npm.cmd",
       "runtimeArgs": ["run", "dev"],
+      "preLaunchTask": "Stop Backend API Port",
       "console": "integratedTerminal",
       "skipFiles": ["<node_internals>/**"]
     },

@@ -7,8 +7,8 @@ import { getOrderStatusLabel, getOrderTimelineIndex, ORDER_TIMELINE_STEPS } from
 
 const paymentLabels = {
   COD: 'Thanh toán khi nhận hàng',
-  MOMO: 'Ví MoMo',
-  ZALOPAY: 'ZaloPay',
+  MOMO: 'MoMo UAT',
+  ZALOPAY: 'ZaloPay Sandbox',
   VNPAY: 'VNPay',
   BANKING: 'Chuyển khoản ngân hàng',
 };
@@ -216,6 +216,7 @@ export function OrderSuccessPage() {
         day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit',
       })
     : null;
+  const orderCode = order.orderCode || `#${order.id}`;
 
   return (
     <main className="luxury-page order-success-page order-success-animated">
@@ -234,7 +235,7 @@ export function OrderSuccessPage() {
           <h1>Đặt hàng thành công!</h1>
           <p>
             Cảm ơn bạn đã lựa chọn <strong>Huy Perfume</strong>. Đơn hàng{' '}
-            <strong className="order-success-id">#{order.id}</strong> đã được
+            <strong className="order-success-id">{orderCode}</strong> đã được
             tiếp nhận và đang chờ xử lý.
           </p>
           <div className="order-success-actions">
@@ -258,7 +259,7 @@ export function OrderSuccessPage() {
             <span className="order-success-stat-icon" aria-hidden="true">🧾</span>
             <div>
               <small>Mã đơn hàng</small>
-              <strong>#{order.id}</strong>
+              <strong>{orderCode}</strong>
             </div>
           </div>
           <div className="order-success-stat">
@@ -295,7 +296,7 @@ export function OrderSuccessPage() {
             <div className="order-success-facts">
               <div>
                 <span>Mã đơn hàng</span>
-                <strong>#{order.id}</strong>
+                <strong>{orderCode}</strong>
               </div>
               <div>
                 <span>Trạng thái</span>

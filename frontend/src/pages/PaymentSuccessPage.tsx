@@ -1,6 +1,7 @@
-import { useEffect, useMemo } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { useCart } from '../hooks/useCart';
+import { orderService } from '../services/orderService';
 import { clearCartVoucher } from '../utils/cartVoucherStorage';
 import { formatPaymentMethodLabel, formatVnCurrency } from '../utils/formatters';
 
@@ -15,8 +16,8 @@ function formatPaymentLabel(value: string | null) {
   const normalized = String(value || '').trim().toLowerCase();
   if (!normalized) return '—';
   if (normalized === 'cod') return 'Thanh toán khi nhận hàng';
-  if (normalized === 'momo') return 'Ví MoMo';
-  if (normalized === 'zalopay') return 'ZaloPay';
+  if (normalized === 'momo') return 'MoMo UAT';
+  if (normalized === 'zalopay') return 'ZaloPay Sandbox';
   if (normalized === 'vnpay') return 'VNPay';
   if (normalized === 'banking') return 'Chuyển khoản ngân hàng';
   return value || '—';
@@ -42,10 +43,14 @@ function DecorativeSparkles() {
 export function PaymentSuccessPage() {
   const { clearCart } = useCart();
   const [searchParams] = useSearchParams();
+  const [orderDetail, setOrderDetail] = useState<any>(null);
+  const [loadingOrderDetail, setLoadingOrderDetail] = useState(false);
   const orderId = searchParams.get('orderId');
   const totalParam = searchParams.get('total');
-  const paymentMethod = searchParams.get('paymentMethod') || searchParams.get('payment');
-  const amount = parseAmount(totalParam);
+  const urlPaymentMethod = searchParams.get('paymentMethod') || searchParams.get('payment');
+  const urlAmount = parseAmount(totalParam);
+  const amount = urlAmount ?? (Number.isFinite(Number(orderDetail?.total)) ? Number(orderDetail.total) : null);
+  const paymentMethod = urlPaymentMethod || orderDetail?.paymentMethod || orderDetail?.payment_method || null;
   const hasOrderId = Boolean(orderId && orderId.trim());
   const title = hasOrderId ? 'Thanh toán thành công!' : 'Đặt hàng thành công!';
   const description = 'Cảm ơn bạn đã mua sắm tại HuyPerfume. Đơn hàng của bạn đang được xử lý và sẽ sớm được giao đến bạn.';
@@ -61,6 +66,34 @@ export function PaymentSuccessPage() {
     clearCart().catch(() => undefined);
     clearCartVoucher();
   }, [clearCart]);
+
+  useEffect(() => {
+    const numericOrderId = Number(orderId);
+    if (!Number.isFinite(numericOrderId) || numericOrderId <= 0) {
+      setOrderDetail(null);
+      return undefined;
+    }
+    if (urlAmount !== null && paymentMethod) return undefined;
+
+    let active = true;
+    setLoadingOrderDetail(true);
+
+    orderService
+      .getOrder(numericOrderId)
+      .then((order) => {
+        if (active) setOrderDetail(order);
+      })
+      .catch(() => {
+        if (active) setOrderDetail(null);
+      })
+      .finally(() => {
+        if (active) setLoadingOrderDetail(false);
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [orderId, paymentMethod, urlAmount]);
 
   return (
     <main className="luxury-page payment-success-page">
@@ -85,7 +118,7 @@ export function PaymentSuccessPage() {
             </div>
             <div className="payment-success-summary-item" role="listitem">
               <span>Tổng tiền</span>
-              <strong>{amount !== null ? formatVnCurrency(amount) : '—'}</strong>
+              <strong>{amount !== null ? formatVnCurrency(amount) : loadingOrderDetail ? 'Đang tải...' : '—'}</strong>
             </div>
             <div className="payment-success-summary-item" role="listitem">
               <span>Phương thức thanh toán</span>

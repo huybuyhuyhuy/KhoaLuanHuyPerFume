@@ -235,6 +235,7 @@ export function normalizeOrder(raw: any): OrderResponse {
 
   return {
     id: asNumber(raw?.id),
+    orderCode: asString(raw?.orderCode ?? raw?.order_code),
     userId: asNumber(raw?.userId ?? raw?.user_id),
     userName: asString(raw?.userName ?? raw?.user_name),
     total: asNumber(raw?.total),
@@ -248,9 +249,11 @@ export function normalizeOrder(raw: any): OrderResponse {
     phone: asString(raw?.phone),
     paymentMethod: asString(raw?.paymentMethod ?? raw?.payment_method),
     paymentMethodLabel: asString(raw?.paymentMethodLabel ?? raw?.payment_method_label),
+    paymentStatus: asString(raw?.paymentStatus ?? raw?.payment_status),
     momoOrderId: asString(raw?.momoOrderId ?? raw?.momo_order_id),
     momoTransId: asString(raw?.momoTransId ?? raw?.momo_trans_id),
     zalopayAppTransId: asString(raw?.zalopayAppTransId ?? raw?.zalopay_app_trans_id),
+    failureReason: asString(raw?.failureReason ?? raw?.failure_reason),
     status: normalizeOrderStatus(raw?.status),
     createdAt: asString(raw?.createdAt ?? raw?.created_at),
     items,

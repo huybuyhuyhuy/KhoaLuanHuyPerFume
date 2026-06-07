@@ -17,8 +17,8 @@ function formatOrderCode(id) {
 
 function formatPaymentMethodLabel(method) {
   if (method === 'COD') return 'Thanh toán khi nhận hàng';
-  if (method === 'MOMO') return 'Ví MoMo';
-  if (method === 'ZALOPAY') return 'ZaloPay';
+  if (method === 'MOMO') return 'MoMo UAT';
+  if (method === 'ZALOPAY') return 'ZaloPay Sandbox';
   if (method === 'VNPAY') return 'VNPay';
   if (method === 'BANKING') return 'Chuyển khoản ngân hàng';
   if (method === 'CREDITCARD') return 'Thẻ ngân hàng';
@@ -131,7 +131,7 @@ export function toTopCategory(row) {
 export function toRecentOrder(row) {
   return {
     id: Number(row.id),
-    orderCode: formatOrderCode(row.id),
+    orderCode: row.order_code || `#${row.id}`,
     customerName: row.customer_name,
     customerEmail: row.customer_email,
     status: row.status,

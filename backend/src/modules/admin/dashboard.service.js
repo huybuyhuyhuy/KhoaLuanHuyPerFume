@@ -30,9 +30,11 @@ function startOfDay(date) {
 }
 
 function toDateString(date) {
-  const y = date.getFullYear();
-  const m = String(date.getMonth() + 1).padStart(2, '0');
-  const d = String(date.getDate()).padStart(2, '0');
+  const value = date instanceof Date ? date : new Date(date);
+  if (Number.isNaN(value.getTime())) return '';
+  const y = value.getFullYear();
+  const m = String(value.getMonth() + 1).padStart(2, '0');
+  const d = String(value.getDate()).padStart(2, '0');
   return `${y}-${m}-${d}`;
 }
 
@@ -331,6 +333,7 @@ export async function getStats() {
     pendingReviews: pendingReviewRows.map(mapper.toPendingReview),
     recentOrders: recentOrderRows.map((row) => ({
       id: Number(row.id),
+      orderCode: row.order_code || `#${row.id}`,
       userName: row.customer_name || 'Khách vãng lai',
       total: Number(row.total || 0),
       status: normalizeOrderStatus(row.status),

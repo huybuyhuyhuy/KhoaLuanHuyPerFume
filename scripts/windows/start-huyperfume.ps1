@@ -119,13 +119,30 @@ function Start-ManagedProcess {
     $nodePath = (Get-Command node.exe -ErrorAction Stop).Source
     $stdout = Join-Path $logPath "$Name.out.log"
     $stderr = Join-Path $logPath "$Name.err.log"
-    $process = Start-Process -FilePath $nodePath `
-        -ArgumentList $Arguments `
-        -WorkingDirectory $WorkingDirectory `
-        -WindowStyle Hidden `
-        -RedirectStandardOutput $stdout `
-        -RedirectStandardError $stderr `
-        -PassThru
+    try {
+        $process = Start-Process -FilePath $nodePath `
+            -ArgumentList $Arguments `
+            -WorkingDirectory $WorkingDirectory `
+            -WindowStyle Hidden `
+            -RedirectStandardOutput $stdout `
+            -RedirectStandardError $stderr `
+            -PassThru
+    } catch [System.ArgumentException] {
+        if ($_.Exception.Message -notlike '*Path*PATH*' -and $_.Exception.Message -notlike '*PATH*Path*') {
+            throw
+        }
+
+        $processInfo = [System.Diagnostics.ProcessStartInfo]::new()
+        $processInfo.FileName = $nodePath
+        $processInfo.Arguments = ($Arguments | ForEach-Object {
+            if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }
+        }) -join ' '
+        $processInfo.WorkingDirectory = $WorkingDirectory
+        $processInfo.UseShellExecute = $false
+        $processInfo.CreateNoWindow = $true
+        $process = [System.Diagnostics.Process]::Start($processInfo)
+        Write-AppLog "Started $Name without redirected logs because the current shell has duplicate Path/PATH variables."
+    }
     Save-ManagedProcess -Name $Name -Process $process
     Write-AppLog "Started $Name (PID $($process.Id))."
 }

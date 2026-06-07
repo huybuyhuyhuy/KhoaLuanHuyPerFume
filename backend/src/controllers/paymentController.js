@@ -3,8 +3,13 @@ import { errorResponse, successResponse } from '../utils/response.js';
 import { query } from '../config/database.js';
 import { getCheckoutStorageCapabilities, hasColumn as hasCheckoutColumn } from '../modules/checkout/checkout.storage.js';
 import { ORDER_STATUS, normalizeOrderStatus } from '../constants/orderStatus.js';
-import { cancelOrderForAdmin, updateOrderStatusWithHistory } from '../models/orderModel.js';
+import { updateOrderStatusWithHistory } from '../models/orderModel.js';
 import { markCartCheckedOut } from '../models/cartModel.js';
+import {
+  createPaymentAttempt,
+  findPaymentAttemptByExternalOrderId,
+  updatePaymentAttempt,
+} from '../modules/payment/paymentAttempt.repository.js';
 
 function envValue(name, fallback = '') {
   const value = process.env[name];
@@ -87,15 +92,69 @@ function paymentReturnAutoConfirmEnabled() {
   return envFlag('PAYMENT_RETURN_AUTO_CONFIRM', process.env.NODE_ENV !== 'production');
 }
 
-function ensurePayableOrder(order, expectedPaymentMethod) {
-  if (expectedPaymentMethod && String(order.payment_method || '').toUpperCase() !== expectedPaymentMethod) {
-    return { code: 400, message: 'Phương thức thanh toán của đơn hàng không khớp' };
-  }
+const MOMO_UAT_REJECTED_MESSAGE = 'Thanh toán MoMo UAT bị từ chối bởi phương thức thanh toán test. Vui lòng thử lại hoặc chọn ZaloPay/COD.';
 
+function normalizeGatewayText(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/\u0110/g, 'd')
+    .replace(/\u0111/g, 'd')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+}
+
+function isMomoFailureMessage(message) {
+  const text = normalizeGatewayText(message);
+  if (!text) return false;
+  return [
+    'transaction rejected',
+    'rejected',
+    'issuer',
+    'declined',
+    'failed',
+    'failure',
+    'error',
+    'tu choi',
+    'khong thanh cong',
+    'that bai',
+    'loi',
+  ].some((keyword) => text.includes(keyword));
+}
+
+function extractMomoFailureReason(data, fallback = MOMO_UAT_REJECTED_MESSAGE) {
+  const reason = data?.message || data?.localMessage || data?.errorMessage || data?.subMessage || data?.description || fallback;
+  return String(reason || fallback).trim().slice(0, 500);
+}
+
+function isMomoApprovedResult(data) {
+  return Number(data?.resultCode ?? -1) === 0 && !isMomoFailureMessage(data?.message);
+}
+
+function isMomoRejectedResult(data) {
+  return Number(data?.resultCode ?? -1) !== 0 || isMomoFailureMessage(data?.message);
+}
+
+function logMomoGatewayResponse(event, payload) {
+  try {
+    console.info(`[MOMO_${event}_RESPONSE]`, JSON.stringify(payload, null, 2));
+  } catch {
+    console.info(`[MOMO_${event}_RESPONSE]`, payload);
+  }
+}
+
+function ensurePayableOrder(order, expectedPaymentMethod) {
   const status = normalizeOrderStatus(order.status);
-  if ([ORDER_STATUS.PENDING_PAYMENT, ORDER_STATUS.PENDING].includes(status)) return null;
-  if (status === ORDER_STATUS.CONFIRMED) {
+  const paymentStatus = String(order.payment_status || '').trim().toUpperCase();
+  if (paymentStatus === 'PAID' || status === ORDER_STATUS.CONFIRMED) {
     return { code: 409, message: 'Đơn hàng đã được thanh toán' };
+  }
+  if ([ORDER_STATUS.CANCELLED_PAYMENT, ORDER_STATUS.CANCELLED, ORDER_STATUS.REFUNDED].includes(status) || paymentStatus === 'CANCELLED') {
+    return { code: 409, message: 'Đơn hàng đã bị hủy. Vui lòng tạo đơn mới.' };
+  }
+  if ([ORDER_STATUS.PENDING_PAYMENT, ORDER_STATUS.PENDING].includes(status)) return null;
+  if ([ORDER_STATUS.PAYMENT_REJECTED, ORDER_STATUS.PAYMENT_FAILED].includes(status)) {
+    return { code: 409, message: 'Đơn hàng cũ đã giải phóng tồn kho. Vui lòng tạo đơn mới.' };
   }
   return { code: 409, message: 'Đơn hàng không còn chờ thanh toán. Vui lòng tạo đơn mới từ giỏ hàng.' };
 }
@@ -140,6 +199,7 @@ function requireMomoConfig() {
     payUrl: envValue('MOMO_PAY_URL', envValue('MOMO_CREATE_URL', 'https://test-payment.momo.vn/v2/gateway/api/create')),
     redirectUrl: envValue('MOMO_REDIRECT_URL', `${apiBase}/api/payment/momo/return`),
     ipnUrl: envValue('MOMO_IPN_URL', `${apiBase}/api/payment/momo/ipn`),
+    requestType: envValue('MOMO_REQUEST_TYPE', 'payWithATM'),
   };
 
   const missing = Object.entries(config).filter(([, value]) => !isConfigured(value)).map(([key]) => key);
@@ -191,8 +251,10 @@ async function getOrderForPayment(orderId, userId = null) {
   const momoOrderSelect = hasCheckoutColumn(orderColumns, 'momo_order_id') ? 'momo_order_id' : 'NULL AS momo_order_id';
   const momoTransSelect = hasCheckoutColumn(orderColumns, 'momo_trans_id') ? 'momo_trans_id' : 'NULL AS momo_trans_id';
   const zaloPaySelect = hasCheckoutColumn(orderColumns, 'zalopay_app_trans_id') ? 'zalopay_app_trans_id' : 'NULL AS zalopay_app_trans_id';
+  const paymentStatusSelect = hasCheckoutColumn(orderColumns, 'payment_status') ? 'payment_status' : 'NULL AS payment_status';
+  const orderCodeSelect = hasCheckoutColumn(orderColumns, 'order_code') ? 'order_code' : 'NULL AS order_code';
   const rows = await query(
-    `SELECT TOP 1 id, user_id, total, status, payment_method, ${momoOrderSelect}, ${momoTransSelect}, ${zaloPaySelect}
+    `SELECT TOP 1 id, user_id, total, status, payment_method, ${paymentStatusSelect}, ${orderCodeSelect}, ${momoOrderSelect}, ${momoTransSelect}, ${zaloPaySelect}
      FROM orders
      WHERE id = ?${userId ? ' AND user_id = ?' : ''}`,
     userId ? [orderId, userId] : [orderId]
@@ -201,10 +263,15 @@ async function getOrderForPayment(orderId, userId = null) {
 }
 
 async function getOrderByMomoOrderId(momoOrderId) {
+  const attempt = await findPaymentAttemptByExternalOrderId('MOMO', momoOrderId);
+  if (attempt?.orderId) return getOrderForPayment(attempt.orderId);
+
   const { orderColumns } = await getCheckoutStorageCapabilities();
   if (hasCheckoutColumn(orderColumns, 'momo_order_id')) {
+    const paymentStatusSelect = hasCheckoutColumn(orderColumns, 'payment_status') ? 'payment_status' : 'NULL AS payment_status';
+    const orderCodeSelect = hasCheckoutColumn(orderColumns, 'order_code') ? 'order_code' : 'NULL AS order_code';
     const rows = await query(
-      `SELECT TOP 1 id, user_id, total, status, payment_method, momo_order_id,
+      `SELECT TOP 1 id, user_id, total, status, payment_method, ${paymentStatusSelect}, ${orderCodeSelect}, momo_order_id,
               ${hasCheckoutColumn(orderColumns, 'momo_trans_id') ? 'momo_trans_id' : 'NULL AS momo_trans_id'},
               ${hasCheckoutColumn(orderColumns, 'zalopay_app_trans_id') ? 'zalopay_app_trans_id' : 'NULL AS zalopay_app_trans_id'}
        FROM orders
@@ -219,10 +286,15 @@ async function getOrderByMomoOrderId(momoOrderId) {
 }
 
 async function getOrderByZaloPayAppTransId(appTransId) {
+  const attempt = await findPaymentAttemptByExternalOrderId('ZALOPAY', appTransId);
+  if (attempt?.orderId) return getOrderForPayment(attempt.orderId);
+
   const { orderColumns } = await getCheckoutStorageCapabilities();
   if (hasCheckoutColumn(orderColumns, 'zalopay_app_trans_id')) {
+    const paymentStatusSelect = hasCheckoutColumn(orderColumns, 'payment_status') ? 'payment_status' : 'NULL AS payment_status';
+    const orderCodeSelect = hasCheckoutColumn(orderColumns, 'order_code') ? 'order_code' : 'NULL AS order_code';
     const rows = await query(
-      `SELECT TOP 1 id, user_id, total, status, payment_method,
+      `SELECT TOP 1 id, user_id, total, status, payment_method, ${paymentStatusSelect}, ${orderCodeSelect},
               ${hasCheckoutColumn(orderColumns, 'momo_order_id') ? 'momo_order_id' : 'NULL AS momo_order_id'},
               ${hasCheckoutColumn(orderColumns, 'momo_trans_id') ? 'momo_trans_id' : 'NULL AS momo_trans_id'},
               zalopay_app_trans_id
@@ -240,11 +312,12 @@ async function getOrderByZaloPayAppTransId(appTransId) {
 async function updatePaidOrder({ orderId, userId = null, expectedPaymentMethod = null, momoOrderId = null, momoTransId = null, zalopayAppTransId = null }) {
   const order = await getOrderForPayment(orderId, userId);
   if (!order) return { code: 404, message: 'Không tìm thấy đơn hàng' };
-  if (expectedPaymentMethod && String(order.payment_method || '').toUpperCase() !== expectedPaymentMethod) {
-    return { code: 400, message: 'Phương thức thanh toán của đơn hàng không khớp' };
-  }
   const currentStatus = normalizeOrderStatus(order.status);
-  if ([ORDER_STATUS.PAYMENT_FAILED, ORDER_STATUS.CANCELLED_PAYMENT, ORDER_STATUS.CANCELLED, ORDER_STATUS.REFUNDED].includes(currentStatus)) {
+  const paymentStatus = String(order.payment_status || '').trim().toUpperCase();
+  if (paymentStatus === 'PAID' || currentStatus === ORDER_STATUS.CONFIRMED) {
+    return { ok: true, status: currentStatus, paymentStatus: 'PAID' };
+  }
+  if ([ORDER_STATUS.CANCELLED_PAYMENT, ORDER_STATUS.CANCELLED, ORDER_STATUS.REFUNDED].includes(currentStatus) || paymentStatus === 'CANCELLED') {
     return { code: 400, message: 'Đơn hàng đã bị hủy hoặc hoàn tiền' };
   }
 
@@ -252,9 +325,15 @@ async function updatePaidOrder({ orderId, userId = null, expectedPaymentMethod =
   const assignments = [];
   const params = [];
 
+  if (expectedPaymentMethod && hasCheckoutColumn(orderColumns, 'payment_method')) {
+    assignments.push('payment_method = ?');
+    params.push(String(expectedPaymentMethod).toUpperCase());
+  }
   if (hasCheckoutColumn(orderColumns, 'momo_order_id')) { assignments.push('momo_order_id = COALESCE(?, momo_order_id)'); params.push(momoOrderId); }
   if (hasCheckoutColumn(orderColumns, 'momo_trans_id')) { assignments.push('momo_trans_id = COALESCE(?, momo_trans_id)'); params.push(momoTransId); }
   if (hasCheckoutColumn(orderColumns, 'zalopay_app_trans_id')) { assignments.push('zalopay_app_trans_id = COALESCE(?, zalopay_app_trans_id)'); params.push(zalopayAppTransId); }
+  if (hasCheckoutColumn(orderColumns, 'payment_status')) { assignments.push("payment_status = N'PAID'"); }
+  if (hasCheckoutColumn(orderColumns, 'failure_reason')) { assignments.push('failure_reason = NULL'); }
 
   if (assignments.length) {
     params.push(orderId);
@@ -278,15 +357,26 @@ async function updatePaidOrder({ orderId, userId = null, expectedPaymentMethod =
   return { ok: true, status: currentStatus };
 }
 
-async function rememberGatewayReference({ orderId, momoOrderId = null, zalopayAppTransId = null }) {
+async function rememberGatewayReference({ orderId, paymentMethod = null, momoOrderId = null, zalopayAppTransId = null, clearFailureReason = false }) {
   const { orderColumns } = await getCheckoutStorageCapabilities();
   const assignments = [];
   const params = [];
+  if (paymentMethod && hasCheckoutColumn(orderColumns, 'payment_method')) { assignments.push('payment_method = ?'); params.push(String(paymentMethod).toUpperCase()); }
   if (momoOrderId && hasCheckoutColumn(orderColumns, 'momo_order_id')) { assignments.push('momo_order_id = ?'); params.push(momoOrderId); }
   if (zalopayAppTransId && hasCheckoutColumn(orderColumns, 'zalopay_app_trans_id')) { assignments.push('zalopay_app_trans_id = ?'); params.push(zalopayAppTransId); }
+  if (hasCheckoutColumn(orderColumns, 'payment_status')) { assignments.push("payment_status = N'PENDING'"); }
+  if (clearFailureReason && hasCheckoutColumn(orderColumns, 'failure_reason')) { assignments.push('failure_reason = NULL'); }
   if (!assignments.length) return;
   params.push(orderId);
   await query(`UPDATE orders SET ${assignments.join(', ')} WHERE id = ?`, params);
+}
+
+async function rememberPaymentFailure({ orderId, failureReason = null }) {
+  const reason = String(failureReason || '').trim().slice(0, 500);
+  if (!orderId || !reason) return;
+  const { orderColumns } = await getCheckoutStorageCapabilities();
+  if (!hasCheckoutColumn(orderColumns, 'failure_reason')) return;
+  await query('UPDATE orders SET failure_reason = ? WHERE id = ?', [reason, orderId]);
 }
 
 async function queryZaloPayOrder(config, appTransId) {
@@ -314,7 +404,13 @@ async function queryZaloPayOrder(config, appTransId) {
 }
 
 function zaloPayReturnStatus(resultCode) {
-  const code = Number(resultCode);
+  const raw = String(resultCode ?? '').trim().toLowerCase();
+  if (['success', 'succeeded', 'paid', 'ok'].includes(raw)) return 'success';
+  if (['pending', 'processing'].includes(raw)) return 'pending';
+  if (['cancel', 'cancelled', 'canceled'].includes(raw)) return 'cancel';
+  if (['fail', 'failed', 'failure', 'error', 'rejected'].includes(raw)) return 'failed';
+
+  const code = Number(raw);
   if ([0, 1].includes(code)) return 'success';
   if (code === 3) return 'pending';
   if ([-49, 2, 4, 6, 7, 8, 9].includes(code)) return 'cancel';
@@ -327,39 +423,51 @@ async function markPaymentNotPaidOrder({
   targetStatus,
   momoOrderId = null,
   zalopayAppTransId = null,
+  failureReason = null,
   note = null,
 }) {
   const order = await getOrderForPayment(orderId);
   if (!order) return { code: 404, message: 'Không tìm thấy đơn hàng' };
-  if (expectedPaymentMethod && String(order.payment_method || '').toUpperCase() !== expectedPaymentMethod) {
-    return { code: 400, message: 'Phương thức thanh toán của đơn hàng không khớp' };
-  }
 
   const currentStatus = normalizeOrderStatus(order.status);
-  if ([ORDER_STATUS.PAYMENT_FAILED, ORDER_STATUS.CANCELLED_PAYMENT, ORDER_STATUS.CANCELLED, ORDER_STATUS.REFUNDED].includes(currentStatus)) {
-    return { ok: true, status: currentStatus };
+  const currentPaymentStatus = String(order.payment_status || '').trim().toUpperCase();
+  if (currentPaymentStatus === 'PAID' || currentStatus === ORDER_STATUS.CONFIRMED) {
+    return { ok: true, status: ORDER_STATUS.CONFIRMED, paymentStatus: 'PAID' };
   }
-  if (currentStatus === ORDER_STATUS.CONFIRMED) {
-    return { ok: true, status: ORDER_STATUS.CONFIRMED };
-  }
-  if (![ORDER_STATUS.PENDING_PAYMENT, ORDER_STATUS.PENDING].includes(currentStatus)) {
-    return { code: 409, message: 'Đơn hàng không ở trạng thái chờ thanh toán' };
+  if ([ORDER_STATUS.CANCELLED_PAYMENT, ORDER_STATUS.CANCELLED, ORDER_STATUS.REFUNDED].includes(currentStatus) || currentPaymentStatus === 'CANCELLED') {
+    await rememberPaymentFailure({ orderId, failureReason });
+    return { code: 409, message: 'Đơn hàng đã bị hủy. Vui lòng tạo đơn mới.' };
   }
 
-  await rememberGatewayReference({ orderId, momoOrderId, zalopayAppTransId });
-  const result = await cancelOrderForAdmin(orderId, {
-    targetStatus,
-    note: note || (targetStatus === ORDER_STATUS.CANCELLED_PAYMENT ? 'Thanh toán online bị hủy' : 'Thanh toán online thất bại'),
-  });
-  if (result.code) return result;
-  return { ok: true, status: targetStatus };
-}
+  const paymentStatus = targetStatus === ORDER_STATUS.PAYMENT_REJECTED
+    ? 'PAYMENT_REJECTED'
+    : targetStatus === ORDER_STATUS.CANCELLED_PAYMENT
+      ? 'PAYMENT_CANCELLED'
+      : 'PAYMENT_FAILED';
 
-function momoReturnStatus(resultCode) {
-  if (Number(resultCode) === 0) return 'success';
-  if ([7000, 7002].includes(Number(resultCode))) return 'pending';
-  if ([7004, 7009].includes(Number(resultCode))) return 'cancel';
-  return 'failed';
+  await rememberGatewayReference({ orderId, paymentMethod: expectedPaymentMethod, momoOrderId, zalopayAppTransId });
+  await rememberPaymentFailure({ orderId, failureReason });
+
+  const { orderColumns } = await getCheckoutStorageCapabilities();
+  const assignments = [];
+  const params = [];
+  if (hasCheckoutColumn(orderColumns, 'payment_status')) {
+    assignments.push('payment_status = ?');
+    params.push(paymentStatus);
+  }
+  if (hasCheckoutColumn(orderColumns, 'failure_reason')) {
+    assignments.push('failure_reason = ?');
+    params.push(String(failureReason || note || '').slice(0, 500));
+  }
+  if (!assignments.length && ![ORDER_STATUS.PENDING_PAYMENT, ORDER_STATUS.PENDING].includes(currentStatus)) {
+    assignments.push('status = ?');
+    params.push(targetStatus);
+  }
+  if (assignments.length) {
+    params.push(orderId);
+    await query(`UPDATE orders SET ${assignments.join(', ')} WHERE id = ?`, params);
+  }
+  return { ok: true, status: currentStatus, paymentStatus };
 }
 
 function momoResultSignaturePayload(data, accessKey) {
@@ -403,7 +511,7 @@ function validateMomoResultPayload(data, credentials, order) {
     return { ok: false, message: 'Số tiền MoMo không khớp đơn hàng' };
   }
 
-  if (Number(data.resultCode || -1) === 0 && !String(data.transId || '').trim()) {
+  if (isMomoApprovedResult(data) && !String(data.transId || '').trim()) {
     return { ok: false, message: 'MoMo transId không hợp lệ' };
   }
 
@@ -424,13 +532,25 @@ export async function createMomo(req, res) {
     if (credentials.code) {
       if (!paymentMockEnabled()) return errorResponse(res, credentials.code, credentials.message);
 
-      const momoOrderId = `${orderId}_${Date.now()}`;
-      await rememberGatewayReference({ orderId, momoOrderId });
+      const amountNumber = Math.max(Math.round(Number(order.total || 0)), 10000);
+      const attempt = await createPaymentAttempt({ orderId, provider: 'MOMO', amount: amountNumber });
+      const momoOrderId = attempt.requestId;
+      await rememberGatewayReference({ orderId, paymentMethod: 'MOMO', momoOrderId, clearFailureReason: true });
       const payUrl = createMockReturnUrl(req, 'momo', { orderId: momoOrderId, resultCode: 0, mock: 1 });
       const failUrl = createMockReturnUrl(req, 'momo', { orderId: momoOrderId, resultCode: 1006, mock: 1 });
       const cancelUrl = createMockReturnUrl(req, 'momo', { orderId: momoOrderId, resultCode: 7004, mock: 1 });
+      await updatePaymentAttempt(attempt.id, {
+        externalOrderId: momoOrderId,
+        status: 'PENDING',
+        payUrl,
+        rawResponse: JSON.stringify({ mock: true, payUrl, failUrl, cancelUrl }),
+      });
       return successResponse(res, 'Tạo thanh toán MoMo demo thành công', {
         orderId,
+        orderCode: order.order_code || `#${orderId}`,
+        paymentAttemptId: attempt.id,
+        paymentRequestId: attempt.requestId,
+        attemptNumber: attempt.attemptNumber,
         momoOrderId,
         ...createMoMoQrPayload(req, { payUrl, qrUrl: payUrl }, payUrl),
         mock: true,
@@ -439,11 +559,13 @@ export async function createMomo(req, res) {
       });
     }
 
-    const requestId = `momo_${Date.now()}_${orderId}`;
-    const momoOrderId = `${orderId}_${Date.now()}`;
-    const orderInfo = `Thanh toán đơn hàng #${orderId}`;
     const amountNumber = Math.max(Math.round(Number(order.total || 0)), 10000);
+    const attempt = await createPaymentAttempt({ orderId, provider: 'MOMO', amount: amountNumber });
+    const requestId = attempt.requestId;
+    const momoOrderId = attempt.requestId;
+    const orderInfo = `Thanh toan don hang #${orderId}`;
     const amount = String(amountNumber);
+    const requestType = credentials.requestType || 'payWithATM';
 
     const rawSignature = [
       `accessKey=${credentials.accessKey}`,
@@ -455,12 +577,13 @@ export async function createMomo(req, res) {
       `partnerCode=${credentials.partnerCode}`,
       `redirectUrl=${credentials.redirectUrl}`,
       `requestId=${requestId}`,
-      `requestType=payWithMethod`,
+      `requestType=${requestType}`,
     ].join('&');
 
     const payload = {
       partnerCode: credentials.partnerCode,
       partnerName: credentials.partnerName,
+      storeName: credentials.partnerName,
       storeId: credentials.storeId,
       requestId,
       amount: amountNumber,
@@ -469,30 +592,67 @@ export async function createMomo(req, res) {
       redirectUrl: credentials.redirectUrl,
       ipnUrl: credentials.ipnUrl,
       lang: 'vi',
-      requestType: 'payWithMethod',
+      requestType,
       autoCapture: true,
       extraData: '',
-      orderGroupId: '',
       signature: hmacSha256Hex(rawSignature, credentials.secretKey),
     };
 
-    await rememberGatewayReference({ orderId, momoOrderId });
+    await rememberGatewayReference({ orderId, paymentMethod: 'MOMO', momoOrderId, clearFailureReason: true });
     const momoResponse = await fetch(credentials.payUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
     const momoBody = await momoResponse.json().catch(() => ({}));
+    logMomoGatewayResponse('CREATE', {
+      httpStatus: momoResponse.status,
+      orderId,
+      momoOrderId,
+      requestId,
+      response: momoBody,
+    });
     const payUrl = momoBody.payUrl || momoBody.deeplink || momoBody.qrCodeUrl || momoBody.qrUrl || '';
-    if (!momoResponse.ok || !payUrl) {
+    if (!momoResponse.ok || !payUrl || isMomoRejectedResult(momoBody)) {
+      const failureReason = extractMomoFailureReason(momoBody, 'MoMo UAT không trả về link thanh toán hợp lệ');
+      await updatePaymentAttempt(attempt.id, {
+        externalOrderId: momoOrderId,
+        status: 'PAYMENT_REJECTED',
+        resultCode: momoBody.resultCode,
+        message: failureReason,
+        payUrl,
+        rawResponse: JSON.stringify(momoBody),
+      });
       await markPaymentNotPaidOrder({
         orderId,
         expectedPaymentMethod: 'MOMO',
-        targetStatus: ORDER_STATUS.PAYMENT_FAILED,
+        targetStatus: ORDER_STATUS.PAYMENT_REJECTED,
         momoOrderId,
-        note: 'MoMo không trả về link thanh toán',
+        failureReason,
+        note: failureReason,
       });
-      return errorResponse(res, 502, 'MoMo không trả về link thanh toán', momoBody);
+      return errorResponse(res, 409, MOMO_UAT_REJECTED_MESSAGE, {
+        gateway: 'MOMO',
+        status: 'PAYMENT_REJECTED',
+        paymentAttemptId: attempt.id,
+        paymentRequestId: attempt.requestId,
+        attemptNumber: attempt.attemptNumber,
+        resultCode: momoBody.resultCode,
+        failureReason,
+        momoResponse: momoBody,
+      });
     }
+    await updatePaymentAttempt(attempt.id, {
+      externalOrderId: momoOrderId,
+      status: 'PENDING',
+      resultCode: momoBody.resultCode,
+      message: momoBody.message,
+      payUrl,
+      rawResponse: JSON.stringify(momoBody),
+    });
 
     return successResponse(res, 'Tạo thanh toán MoMo thành công', {
       orderId,
+      orderCode: order.order_code || `#${orderId}`,
+      paymentAttemptId: attempt.id,
+      paymentRequestId: attempt.requestId,
+      attemptNumber: attempt.attemptNumber,
       momoOrderId,
       ...createMoMoQrPayload(req, momoBody, payUrl),
     });
@@ -505,6 +665,7 @@ export async function createMomo(req, res) {
 export async function momoIpn(req, res) {
   try {
     const body = req.body || {};
+    logMomoGatewayResponse('IPN', body);
     const credentials = requireMomoConfig();
     if (credentials.code) return errorResponse(res, credentials.code, credentials.message);
     const receivedSignature = String(body.signature || '');
@@ -526,32 +687,51 @@ export async function momoIpn(req, res) {
     const computed = hmacSha256Hex(raw, credentials.secretKey);
     if (!receivedSignature || receivedSignature !== computed) return errorResponse(res, 400, 'Chữ ký MoMo không hợp lệ');
 
-    const order = await getOrderByMomoOrderId(String(body.orderId || ''));
+    const momoExternalOrderId = String(body.orderId || '');
+    const attempt = await findPaymentAttemptByExternalOrderId('MOMO', momoExternalOrderId);
+    const order = attempt?.orderId ? await getOrderForPayment(attempt.orderId) : await getOrderByMomoOrderId(momoExternalOrderId);
     if (!order) return errorResponse(res, 400, 'orderId không hợp lệ');
 
     const validation = validateMomoResultPayload(body, credentials, order);
     if (!validation.ok) return errorResponse(res, 400, validation.message);
 
-    if (Number(body.resultCode || -1) === 0) {
+    if (isMomoApprovedResult(body)) {
       const result = await updatePaidOrder({
         orderId: order.id,
         expectedPaymentMethod: 'MOMO',
-        momoOrderId: String(body.orderId || ''),
+        momoOrderId: momoExternalOrderId,
         momoTransId: String(body.transId || ''),
       });
       if (result.code) return errorResponse(res, result.code, result.message);
-    } else {
-      const status = momoReturnStatus(body.resultCode);
-      if (['failed', 'cancel'].includes(status)) {
-        const result = await markPaymentNotPaidOrder({
-          orderId: order.id,
-          expectedPaymentMethod: 'MOMO',
-          targetStatus: status === 'cancel' ? ORDER_STATUS.CANCELLED_PAYMENT : ORDER_STATUS.PAYMENT_FAILED,
-          momoOrderId: String(body.orderId || ''),
-          note: status === 'cancel' ? 'MoMo thanh toán bị hủy' : 'MoMo thanh toán thất bại',
+      if (attempt?.id) {
+        await updatePaymentAttempt(attempt.id, {
+          status: 'PAID',
+          resultCode: body.resultCode,
+          message: body.message,
+          transactionId: body.transId,
+          rawResponse: JSON.stringify(body),
         });
-        if (result.code) return errorResponse(res, result.code, result.message);
       }
+    } else {
+      const failureReason = extractMomoFailureReason(body);
+      if (attempt?.id) {
+        await updatePaymentAttempt(attempt.id, {
+          status: 'PAYMENT_REJECTED',
+          resultCode: body.resultCode,
+          message: failureReason,
+          transactionId: body.transId,
+          rawResponse: JSON.stringify(body),
+        });
+      }
+      const result = await markPaymentNotPaidOrder({
+        orderId: order.id,
+        expectedPaymentMethod: 'MOMO',
+        targetStatus: ORDER_STATUS.PAYMENT_REJECTED,
+        momoOrderId: momoExternalOrderId,
+        failureReason,
+        note: failureReason,
+      });
+      if (result.code) return errorResponse(res, result.code, result.message);
     }
     return res.status(204).send();
   } catch (error) {
@@ -564,10 +744,14 @@ export async function momoReturn(req, res) {
   try {
     const resultCode = Number(req.query.resultCode || -1);
     const momoOrderId = String(req.query.orderId || '');
-    const order = await getOrderByMomoOrderId(momoOrderId);
-    if (!order) return redirectToFrontend(res, paymentRedirectResponse(req, 'momo', 'failed'));
+    const momoReturnPayload = { ...req.query, resultCode };
+    logMomoGatewayResponse('RETURN', momoReturnPayload);
+    const attempt = await findPaymentAttemptByExternalOrderId('MOMO', momoOrderId);
+    const order = attempt?.orderId ? await getOrderForPayment(attempt.orderId) : await getOrderByMomoOrderId(momoOrderId);
+    if (!order) return redirectToFrontend(res, paymentRedirectResponse(req, 'momo', 'rejected', null, { resultCode }));
 
-    let status = momoReturnStatus(resultCode);
+    let status = isMomoApprovedResult(momoReturnPayload) ? 'success' : 'rejected';
+    let failureReason = null;
     if (status === 'success') {
       if (paymentReturnAutoConfirmEnabled() || String(req.query.mock || '') === '1') {
         await updatePaidOrder({
@@ -577,19 +761,39 @@ export async function momoReturn(req, res) {
           momoTransId: String(req.query.transId || ''),
         });
       }
+      if (attempt?.id) {
+        await updatePaymentAttempt(attempt.id, {
+          status: 'PAID',
+          resultCode,
+          message: String(req.query.message || ''),
+          transactionId: String(req.query.transId || ''),
+          rawResponse: JSON.stringify(momoReturnPayload),
+        });
+      }
       const refreshedOrder = await getOrderForPayment(order.id);
       status = normalizeOrderStatus(refreshedOrder?.status) === ORDER_STATUS.CONFIRMED ? 'success' : 'pending';
-    } else if (['failed', 'cancel'].includes(status)) {
+    } else {
+      failureReason = extractMomoFailureReason(momoReturnPayload);
+      if (attempt?.id) {
+        await updatePaymentAttempt(attempt.id, {
+          status: 'PAYMENT_REJECTED',
+          resultCode,
+          message: failureReason,
+          transactionId: String(req.query.transId || ''),
+          rawResponse: JSON.stringify(momoReturnPayload),
+        });
+      }
       const result = await markPaymentNotPaidOrder({
         orderId: order.id,
         expectedPaymentMethod: 'MOMO',
-        targetStatus: status === 'cancel' ? ORDER_STATUS.CANCELLED_PAYMENT : ORDER_STATUS.PAYMENT_FAILED,
+        targetStatus: ORDER_STATUS.PAYMENT_REJECTED,
         momoOrderId,
-        note: status === 'cancel' ? 'MoMo thanh toán bị hủy' : 'MoMo thanh toán thất bại',
+        failureReason,
+        note: failureReason,
       });
       if (!result.code && result.status === ORDER_STATUS.CONFIRMED) status = 'success';
     }
-    return redirectToFrontend(res, paymentRedirectResponse(req, 'momo', status, order.id, { resultCode }));
+    return redirectToFrontend(res, paymentRedirectResponse(req, 'momo', status, order.id, { resultCode, reason: failureReason }));
   } catch (error) {
     console.error('[MOMO_RETURN_ERROR]', error);
     return redirectToFrontend(res, paymentRedirectResponse(req, 'momo', 'error'));
@@ -612,13 +816,25 @@ export async function createZaloPay(req, res) {
 
       const now = new Date();
       const yymmdd = now.toISOString().slice(2, 10).replace(/-/g, '');
-      const appTransId = `${yymmdd}_${orderId}_${Date.now()}`;
-      await rememberGatewayReference({ orderId, zalopayAppTransId: appTransId });
+      const amount = Math.round(Number(order.total || 0));
+      const attempt = await createPaymentAttempt({ orderId, provider: 'ZALOPAY', amount });
+      const appTransId = `${yymmdd}_${attempt.requestId}`;
+      await rememberGatewayReference({ orderId, paymentMethod: 'ZALOPAY', zalopayAppTransId: appTransId, clearFailureReason: true });
       const payUrl = createMockReturnUrl(req, 'zalopay', { apptransid: appTransId, resultcode: 1, mock: 1 });
       const failUrl = createMockReturnUrl(req, 'zalopay', { apptransid: appTransId, resultcode: 3, mock: 1 });
       const cancelUrl = createMockReturnUrl(req, 'zalopay', { apptransid: appTransId, resultcode: 2, mock: 1 });
+      await updatePaymentAttempt(attempt.id, {
+        externalOrderId: appTransId,
+        status: 'PENDING',
+        payUrl,
+        rawResponse: JSON.stringify({ mock: true, payUrl, failUrl, cancelUrl }),
+      });
       return successResponse(res, 'Tạo thanh toán ZaloPay demo thành công', {
         orderId,
+        orderCode: order.order_code || `#${orderId}`,
+        paymentAttemptId: attempt.id,
+        paymentRequestId: attempt.requestId,
+        attemptNumber: attempt.attemptNumber,
         appTransId,
         orderUrl: payUrl,
         paymentUrl: payUrl,
@@ -630,11 +846,15 @@ export async function createZaloPay(req, res) {
 
     const now = new Date();
     const yymmdd = now.toISOString().slice(2, 10).replace(/-/g, '');
-    const appTransId = `${yymmdd}_${orderId}_${Date.now()}`;
+    const amount = Math.round(Number(order.total || 0));
+    const attempt = await createPaymentAttempt({ orderId, provider: 'ZALOPAY', amount });
+    const appTransId = `${yymmdd}_${attempt.requestId}`;
     const appUser = String(req.user?.email || `user_${req.user?.id || 'guest'}`);
     const appTime = Date.now();
-    const amount = Math.round(Number(order.total || 0));
-    const embedData = JSON.stringify({ redirecturl: config.redirectUrl });
+    const gatewayReturnUrl = new URL(config.redirectUrl);
+    gatewayReturnUrl.searchParams.set('apptransid', appTransId);
+    gatewayReturnUrl.searchParams.set('orderId', String(orderId));
+    const embedData = JSON.stringify({ redirecturl: gatewayReturnUrl.toString() });
     const item = '[]';
     const description = `Thanh toán đơn hàng #${orderId}`;
     const macData = [config.appId, appTransId, appUser, amount, appTime, embedData, item].join('|');
@@ -650,24 +870,52 @@ export async function createZaloPay(req, res) {
       description,
       bank_code: '',
       callback_url: config.callbackUrl,
+      redirect_url: gatewayReturnUrl.toString(),
       mac: hmacSha256Hex(macData, config.key1),
     });
 
-    await rememberGatewayReference({ orderId, zalopayAppTransId: appTransId });
+    await rememberGatewayReference({ orderId, paymentMethod: 'ZALOPAY', zalopayAppTransId: appTransId, clearFailureReason: true });
     const response = await fetch(config.createUrl, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body: form.toString() });
     const zaloPayResponse = await response.json().catch(() => ({}));
     if (!response.ok || Number(zaloPayResponse.return_code || 0) !== 1 || !zaloPayResponse.order_url) {
+      const failureReason = zaloPayResponse.return_message || zaloPayResponse.sub_return_message || 'ZaloPay không trả về link thanh toán';
+      await updatePaymentAttempt(attempt.id, {
+        externalOrderId: appTransId,
+        status: 'PAYMENT_FAILED',
+        resultCode: zaloPayResponse.return_code,
+        message: failureReason,
+        rawResponse: JSON.stringify(zaloPayResponse),
+      });
       await markPaymentNotPaidOrder({
         orderId,
         expectedPaymentMethod: 'ZALOPAY',
         targetStatus: ORDER_STATUS.PAYMENT_FAILED,
         zalopayAppTransId: appTransId,
-        note: 'ZaloPay không trả về link thanh toán',
+        failureReason,
+        note: failureReason,
       });
       return errorResponse(res, 502, 'ZaloPay không trả về link thanh toán', zaloPayResponse);
     }
+    await updatePaymentAttempt(attempt.id, {
+      externalOrderId: appTransId,
+      status: 'PENDING',
+      resultCode: zaloPayResponse.return_code,
+      message: zaloPayResponse.return_message,
+      payUrl: zaloPayResponse.order_url,
+      rawResponse: JSON.stringify(zaloPayResponse),
+    });
 
-    return successResponse(res, 'Tạo thanh toán ZaloPay thành công', { orderId, appTransId, orderUrl: zaloPayResponse.order_url, paymentUrl: zaloPayResponse.order_url, zaloPayResponse });
+    return successResponse(res, 'Tạo thanh toán ZaloPay thành công', {
+      orderId,
+      orderCode: order.order_code || `#${orderId}`,
+      paymentAttemptId: attempt.id,
+      paymentRequestId: attempt.requestId,
+      attemptNumber: attempt.attemptNumber,
+      appTransId,
+      orderUrl: zaloPayResponse.order_url,
+      paymentUrl: zaloPayResponse.order_url,
+      zaloPayResponse,
+    });
   } catch (error) {
     console.error('[ZALOPAY_CREATE_ERROR]', error);
     return errorResponse(res, 500, 'Lỗi tạo thanh toán ZaloPay', { detail: error.message });
@@ -690,7 +938,8 @@ export async function zaloPayCallback(req, res) {
 
     const data = JSON.parse(dataStr);
     const appTransId = String(data.app_trans_id || '');
-    const order = await getOrderByZaloPayAppTransId(appTransId);
+    const attempt = await findPaymentAttemptByExternalOrderId('ZALOPAY', appTransId);
+    const order = attempt?.orderId ? await getOrderForPayment(attempt.orderId) : await getOrderByZaloPayAppTransId(appTransId);
     if (!order) {
       return res.json({ return_code: 0, return_message: 'Không tìm thấy đơn hàng' });
     }
@@ -708,6 +957,15 @@ export async function zaloPayCallback(req, res) {
     if (result.code) {
       return res.json({ return_code: 0, return_message: result.message });
     }
+    if (attempt?.id) {
+      await updatePaymentAttempt(attempt.id, {
+        status: 'PAID',
+        resultCode: data.status || data.return_code || 1,
+        message: 'success',
+        transactionId: data.zp_trans_id || data.server_time || '',
+        rawResponse: dataStr,
+      });
+    }
 
     return res.json({ return_code: 1, return_message: 'success' });
   } catch (error) {
@@ -719,30 +977,56 @@ export async function zaloPayCallback(req, res) {
 export async function zaloPayReturn(req, res) {
   try {
     const appTransId = String(req.query.apptransid || req.query.app_trans_id || req.query.appTransId || '');
-    const order = await getOrderByZaloPayAppTransId(appTransId);
+    const attempt = await findPaymentAttemptByExternalOrderId('ZALOPAY', appTransId);
+    const order = attempt?.orderId ? await getOrderForPayment(attempt.orderId) : await getOrderByZaloPayAppTransId(appTransId);
     if (!order) return redirectToFrontend(res, paymentRedirectResponse(req, 'zalopay', 'failed'));
 
     const orderId = Number(order.id);
-    const resultCodeRaw = req.query.resultcode ?? req.query.resultCode ?? req.query.status;
+    const resultCodeRaw = req.query.resultcode ?? req.query.resultCode ?? req.query.returncode ?? req.query.return_code ?? req.query.status;
     const isMockReturn = String(req.query.mock || '') === '1';
-    let status = resultCodeRaw === undefined ? 'pending' : zaloPayReturnStatus(resultCodeRaw);
+    const returnedStatus = resultCodeRaw === undefined ? 'pending' : zaloPayReturnStatus(resultCodeRaw);
+    const trustSuccessfulReturn = paymentReturnAutoConfirmEnabled() && returnedStatus === 'success';
+    let status = returnedStatus;
+    let verificationResponse = null;
 
     if (!isMockReturn) {
       const config = requireZaloPayConfig(req);
       if (!config.code) {
-        const queryResult = await queryZaloPayOrder(config, appTransId);
-        status = queryResult.status;
+        try {
+          const queryResult = await queryZaloPayOrder(config, appTransId);
+          verificationResponse = queryResult.body || null;
+          status = trustSuccessfulReturn && queryResult.status !== 'success'
+            ? 'success'
+            : queryResult.status;
+        } catch (error) {
+          verificationResponse = { error: error.message };
+          if (!trustSuccessfulReturn) throw error;
+          status = 'success';
+        }
       }
     }
 
     if (status === 'success') {
+      const successResultCode = verificationResponse?.return_code
+        ?? verificationResponse?.status
+        ?? resultCodeRaw
+        ?? 1;
       const result = await updatePaidOrder({
         orderId,
         expectedPaymentMethod: 'ZALOPAY',
         zalopayAppTransId: appTransId,
       });
       if (!result.code) {
-        return redirectToFrontend(res, paymentRedirectResponse(req, 'zalopay', 'success', orderId, { resultCode: resultCodeRaw }));
+        if (attempt?.id) {
+          await updatePaymentAttempt(attempt.id, {
+            status: 'PAID',
+            resultCode: successResultCode,
+            message: 'success',
+            transactionId: verificationResponse?.zp_trans_id || verificationResponse?.server_time || '',
+            rawResponse: JSON.stringify({ returnQuery: req.query || {}, verificationResponse }),
+          });
+        }
+        return redirectToFrontend(res, paymentRedirectResponse(req, 'zalopay', 'success', orderId, { resultCode: successResultCode }));
       }
       status = 'pending';
     }
@@ -756,8 +1040,17 @@ export async function zaloPayReturn(req, res) {
       expectedPaymentMethod: 'ZALOPAY',
       targetStatus: status === 'cancel' ? ORDER_STATUS.CANCELLED_PAYMENT : ORDER_STATUS.PAYMENT_FAILED,
       zalopayAppTransId: appTransId,
+      failureReason: status === 'cancel' ? 'ZaloPay thanh toán bị hủy' : 'ZaloPay thanh toán thất bại',
       note: status === 'cancel' ? 'ZaloPay thanh toán bị hủy' : 'ZaloPay thanh toán thất bại',
     });
+    if (attempt?.id) {
+      await updatePaymentAttempt(attempt.id, {
+        status: status === 'cancel' ? 'PAYMENT_CANCELLED' : 'PAYMENT_FAILED',
+        resultCode: resultCodeRaw,
+        message: status === 'cancel' ? 'ZaloPay thanh toán bị hủy' : 'ZaloPay thanh toán thất bại',
+        rawResponse: JSON.stringify(req.query || {}),
+      });
+    }
     if (!result.code && result.status === ORDER_STATUS.CONFIRMED) {
       return redirectToFrontend(res, paymentRedirectResponse(req, 'zalopay', 'success', orderId));
     }

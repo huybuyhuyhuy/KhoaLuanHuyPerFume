@@ -98,7 +98,7 @@ export function OrderHistoryPage() {
                 <tbody>
                   {orders.map((order) => (
                     <tr key={order.id}>
-                      <td><strong>#{order.id}</strong></td>
+                      <td><strong>{order.orderCode || `#${order.id}`}</strong></td>
                       <td>{new Date(order.createdAt).toLocaleDateString('vi-VN')}</td>
                       <td><strong>{formatVnCurrency(order.total)}</strong></td>
                       <td>{order.paymentMethodLabel || formatPaymentMethodLabel(order.paymentMethod)}</td>

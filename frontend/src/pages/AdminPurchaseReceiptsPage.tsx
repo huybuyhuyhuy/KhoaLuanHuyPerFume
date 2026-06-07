@@ -140,12 +140,33 @@ function productLabel(product: ReceiptProductOption) {
   return `${product.name}${product.sku ? ` · ${product.sku}` : ''}`;
 }
 
+function cleanVariantSku(value?: string) {
+  const sku = String(value || '').trim();
+  if (!sku || sku === '-FULL') return '';
+  return sku;
+}
+
+function variantTypeLabel(value?: string) {
+  const normalized = String(value || '').trim().toUpperCase();
+  if (normalized === 'FULL' || normalized === 'FULL_BOTTLE') return 'Full chai';
+  return value || 'Biến thể';
+}
+
 function variantLabel(variant: ReceiptProductOption['variants'][number]) {
   return [
-    variant.volumeLabel || variant.variantType || 'Biến thể',
-    variant.sku || '',
-    `tồn ${formatNumber(variant.stockQuantity)}`,
+    variant.volumeLabel || variantTypeLabel(variant.variantType),
+    variantTypeLabel(variant.variantType),
+    cleanVariantSku(variant.sku),
+    `tồn hiện tại ${formatNumber(variant.stockQuantity)}`,
   ].filter(Boolean).join(' · ');
+}
+
+function stockPreview(product: ReceiptProductOption | undefined, variantId: string, quantity: string) {
+  if (!product) return '';
+  const variant = product.variants.find((item) => String(item.variantId) === String(variantId));
+  const currentStock = variant ? Number(variant.stockQuantity || 0) : Number(product.stock || 0);
+  const importedQuantity = Math.max(0, Number(quantity) || 0);
+  return `Tồn hiện tại: ${formatNumber(currentStock)} · Sau nhập: ${formatNumber(currentStock + importedQuantity)}`;
 }
 
 export function AdminPurchaseReceiptsPage() {
@@ -290,7 +311,11 @@ export function AdminPurchaseReceiptsPage() {
       ...current,
       items: current.items.map((item, itemIndex) => {
         if (itemIndex !== index) return item;
-        if (field === 'productId') return { ...item, productId: value, variantId: '' };
+        if (field === 'productId') {
+          const product = productById.get(String(value));
+          const defaultVariantId = product?.variants.length === 1 ? String(product.variants[0].variantId) : '';
+          return { ...item, productId: value, variantId: defaultVariantId };
+        }
         return { ...item, [field]: value };
       }),
     }));
@@ -639,6 +664,7 @@ export function AdminPurchaseReceiptsPage() {
               {form.items.map((item, index) => {
                 const product = productById.get(item.productId);
                 const lineTotal = Math.max(0, Number(item.quantity) || 0) * Math.max(0, Number(item.importPrice) || 0);
+                const selectedStockPreview = stockPreview(product, item.variantId, item.quantity);
                 return (
                   <div className="admin-receipt-item-row" key={`${index}-${item.productId}-${item.variantId}`}>
                     <label className="product">
@@ -663,6 +689,7 @@ export function AdminPurchaseReceiptsPage() {
                           <option key={variant.variantId} value={variant.variantId}>{variantLabel(variant)}</option>
                         ))}
                       </select>
+                      {selectedStockPreview && <small className="admin-receipt-stock-preview">{selectedStockPreview}</small>}
                     </label>
                     <label>
                       <span>Số lượng</span>

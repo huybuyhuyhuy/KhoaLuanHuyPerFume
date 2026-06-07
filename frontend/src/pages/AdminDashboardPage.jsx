@@ -338,7 +338,7 @@ function RecentOrders({ orders }) {
       {rows.map((order) => (
         <article className="huy-admin-recent-order" key={order.id}>
           <div>
-            <strong>#{order.id}</strong>
+            <strong>{order.orderCode || `#${order.id}`}</strong>
             <span>{order.userName || order.customerName || 'Khách vãng lai'}</span>
           </div>
           <AdminStatusBadge status={order.status} />

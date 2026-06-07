@@ -1,7 +1,7 @@
 import { getDbPool, query, sql } from '../config/database.js';
 import { getCart, markCartCheckedOut } from './cartModel.js';
 import { invalidateProductCache } from './productModel.js';
-import { computeDecantStock, decrementDecantInventory, decrementFullBottleInventory, restoreDecantInventory, syncVariantStock } from './decantInventoryModel.js';
+import { computeDecantStock, decrementDecantInventory, decrementFullBottleInventory, ensureDecantInventoryTables, restoreDecantInventory, syncVariantStock } from './decantInventoryModel.js';
 import { getProductStorageCapabilities, hasOrderItemVariantColumn } from '../modules/products/product.repository.js';
 import { getCheckoutStorageCapabilities } from '../modules/checkout/checkout.storage.js';
 import {
@@ -92,6 +92,7 @@ function toOrder(row, items = []) {
   const voucherDiscountAmount = Number(row.voucher_discount_amount || 0);
   return {
     id: row.id,
+    orderCode: row.order_code || `#${row.id}`,
     userId: row.user_id,
     userName: row.user_name || '',
     total: Number(row.total || 0),
@@ -107,9 +108,11 @@ function toOrder(row, items = []) {
     phone: row.phone || '',
     paymentMethod: row.payment_method || '',
     paymentMethodLabel: formatPaymentMethodLabel(row.payment_method),
+    paymentStatus: row.payment_status || '',
     momoOrderId: row.momo_order_id || '',
     momoTransId: row.momo_trans_id || '',
     zalopayAppTransId: row.zalopay_app_trans_id || '',
+    failureReason: row.failure_reason || '',
     status: normalizeOrderStatus(row.status),
     createdAt: row.created_at,
     items,
@@ -267,6 +270,20 @@ function validatePaymentMethod(paymentMethod) {
   return allowed.includes(String(paymentMethod || '').toUpperCase());
 }
 
+function buildOrderFailureSelect(checkoutCapabilities, alias = 'o') {
+  return hasColumn(checkoutCapabilities?.orderColumns || new Set(), 'failure_reason')
+    ? `${alias}.failure_reason`
+    : 'NULL AS failure_reason';
+}
+
+function buildOrderPaymentSelect(checkoutCapabilities, alias = 'o') {
+  const columns = checkoutCapabilities?.orderColumns || new Set();
+  return [
+    hasColumn(columns, 'order_code') ? `${alias}.order_code` : `CONCAT(N'#', ${alias}.id) AS order_code`,
+    hasColumn(columns, 'payment_status') ? `${alias}.payment_status` : 'NULL AS payment_status',
+  ].join(', ');
+}
+
 function normalizePaymentMethod(paymentMethod) {
   return String(paymentMethod || '').trim().toUpperCase();
 }
@@ -274,8 +291,8 @@ function normalizePaymentMethod(paymentMethod) {
 function formatPaymentMethodLabel(paymentMethod) {
   const method = normalizePaymentMethod(paymentMethod);
   if (method === 'COD') return 'Thanh toán khi nhận hàng';
-  if (method === 'MOMO') return 'Ví MoMo';
-  if (method === 'ZALOPAY') return 'ZaloPay';
+  if (method === 'MOMO') return 'MoMo UAT';
+  if (method === 'ZALOPAY') return 'ZaloPay Sandbox';
   if (method === 'VNPAY') return 'VNPay';
   if (method === 'BANKING') return 'Chuyển khoản ngân hàng';
   if (method === 'CREDITCARD') return 'Thẻ ngân hàng';
@@ -724,6 +741,7 @@ export async function checkoutOrder({ userId, shippingAddress, phone, paymentMet
       });
 
       const capabilities = await getProductStorageCapabilities();
+      await ensureDecantInventoryTables();
       const pool = await getDbPool();
       transaction = new sql.Transaction(pool);
       await transaction.begin();
@@ -776,9 +794,14 @@ export async function checkoutOrder({ userId, shippingAddress, phone, paymentMet
       request.input('phone', sql.NVarChar, String(phone).trim());
       request.input('paymentMethod', sql.NVarChar, safePaymentMethod);
       request.input('status', sql.NVarChar, initialOrderStatus);
+      request.input('paymentStatus', sql.NVarChar, 'PENDING');
 
       const orderColumns = ['user_id', 'total', 'shipping_address', 'phone', 'payment_method', 'status'];
       const orderValues = ['@userId', '@total', '@shippingAddress', '@phone', '@paymentMethod', '@status'];
+      if (hasColumn(checkoutCapabilities.orderColumns, 'payment_status')) {
+        orderColumns.push('payment_status');
+        orderValues.push('@paymentStatus');
+      }
       if (safeIdempotencyKey && hasColumn(checkoutCapabilities.orderColumns, 'checkout_idempotency_key')) {
         request.input('idempotencyKey', sql.NVarChar, safeIdempotencyKey);
         orderColumns.push('checkout_idempotency_key');
@@ -828,6 +851,16 @@ export async function checkoutOrder({ userId, shippingAddress, phone, paymentMet
 
       const orderId = orderResult.recordset?.[0]?.id;
       if (!orderId) throw new Error('Khong tao duoc don hang');
+      if (hasColumn(checkoutCapabilities.orderColumns, 'order_code')) {
+        const codeRequest = new sql.Request(transaction);
+        codeRequest.input('orderId', sql.Int, orderId);
+        codeRequest.input('orderCode', sql.NVarChar, `#${orderId}`);
+        await codeRequest.query(
+          `UPDATE orders
+           SET order_code = COALESCE(NULLIF(LTRIM(RTRIM(order_code)), N''), @orderCode)
+           WHERE id = @orderId`
+        );
+      }
 
       if (voucher?.id) {
         const voucherUsageResult = await reserveVoucherUsage(transaction, voucher.id);
@@ -974,6 +1007,8 @@ export async function getOrderByIdForUser(orderId, userId) {
   const orderRows = await query(
     `SELECT TOP 1 o.id, o.user_id, u.name AS user_name, o.total, o.shipping_address, o.phone,
             o.payment_method, o.momo_order_id, o.momo_trans_id, o.zalopay_app_trans_id,
+            ${buildOrderPaymentSelect(checkoutCapabilities, 'o')},
+            ${buildOrderFailureSelect(checkoutCapabilities, 'o')},
             o.status, o.created_at, ${buildOrderVoucherSelect(checkoutCapabilities, 'o')}
      FROM orders o
      INNER JOIN users u ON u.id = o.user_id
@@ -1000,11 +1035,12 @@ export async function listOrderHistory(userId) {
   const orderRows = await query(
     `SELECT o.id, o.user_id, u.name AS user_name, o.total, o.shipping_address, o.phone,
             o.payment_method, o.momo_order_id, o.momo_trans_id, o.zalopay_app_trans_id,
+            ${buildOrderPaymentSelect(checkoutCapabilities, 'o')},
+            ${buildOrderFailureSelect(checkoutCapabilities, 'o')},
             o.status, o.created_at, ${buildOrderVoucherSelect(checkoutCapabilities, 'o')}
      FROM orders o
      INNER JOIN users u ON u.id = o.user_id
      WHERE o.user_id = ?
-       AND UPPER(ISNULL(o.status, '')) NOT IN ('PENDING_PAYMENT', 'PAYMENT_FAILED', 'CANCELLED_PAYMENT')
      ORDER BY o.id DESC`,
     [userId]
   );
@@ -1136,6 +1172,7 @@ async function releaseCancelledOrderInventory({
 }) {
   const capabilities = await getProductStorageCapabilities();
   const checkoutCapabilities = await getCheckoutStorageCapabilities();
+  await ensureDecantInventoryTables();
   const pool = await getDbPool();
   const transaction = new sql.Transaction(pool);
   await transaction.begin();
@@ -1157,7 +1194,7 @@ async function releaseCancelledOrderInventory({
       return { code: 404, message: 'Khong tim thay don hang' };
     }
     const currentStatus = normalizeOrderStatus(order.status);
-    if ([ORDER_STATUS.PAYMENT_FAILED, ORDER_STATUS.CANCELLED_PAYMENT, ORDER_STATUS.CANCELLED, ORDER_STATUS.REFUNDED].includes(currentStatus)) {
+    if ([ORDER_STATUS.PAYMENT_REJECTED, ORDER_STATUS.PAYMENT_FAILED, ORDER_STATUS.CANCELLED_PAYMENT, ORDER_STATUS.CANCELLED, ORDER_STATUS.REFUNDED].includes(currentStatus)) {
       await transaction.rollback();
       return { code: 400, message: 'Đơn hàng đã bị hủy hoặc hoàn tiền' };
     }
@@ -1166,11 +1203,7 @@ async function releaseCancelledOrderInventory({
       await transaction.rollback();
       return { code: 409, message: 'Đơn đang giao hoặc đã hoàn tất, không thể hủy' };
     }
-    const effectiveTargetStatus = targetStatus === ORDER_STATUS.CANCELLED &&
-      currentStatus === ORDER_STATUS.PENDING_PAYMENT &&
-      isOnlinePaymentMethod(order.payment_method)
-      ? ORDER_STATUS.CANCELLED_PAYMENT
-      : targetStatus;
+    const effectiveTargetStatus = targetStatus;
 
     if (!canTransitionOrderStatus(currentStatus, effectiveTargetStatus)) {
       await transaction.rollback();
@@ -1180,10 +1213,11 @@ async function releaseCancelledOrderInventory({
     const statusRequest = new sql.Request(transaction);
     statusRequest.input('orderId', sql.Int, orderId);
     statusRequest.input('status', sql.NVarChar, effectiveTargetStatus);
+    const statusAssignments = ['status = @status'];
+    if (hasColumn(checkoutCapabilities.orderColumns, 'inventory_status')) statusAssignments.push("inventory_status = 'RELEASED'");
+    if (hasColumn(checkoutCapabilities.orderColumns, 'payment_status')) statusAssignments.push("payment_status = 'CANCELLED'");
     await statusRequest.query(
-      hasColumn(checkoutCapabilities.orderColumns, 'inventory_status')
-        ? "UPDATE orders SET status = @status, inventory_status = 'RELEASED' WHERE id = @orderId"
-        : 'UPDATE orders SET status = @status WHERE id = @orderId'
+      `UPDATE orders SET ${statusAssignments.join(', ')} WHERE id = @orderId`
     );
     await insertOrderStatusHistory(transaction, {
       orderId,
@@ -1252,11 +1286,13 @@ async function releaseCancelledOrderInventory({
         metadata: {
           reason: effectiveTargetStatus === ORDER_STATUS.REFUNDED
             ? 'order_refunded'
-            : effectiveTargetStatus === ORDER_STATUS.PAYMENT_FAILED
-              ? 'payment_failed'
-              : effectiveTargetStatus === ORDER_STATUS.CANCELLED_PAYMENT
-                ? 'payment_cancelled'
-                : 'order_cancelled',
+            : effectiveTargetStatus === ORDER_STATUS.PAYMENT_REJECTED
+              ? 'payment_rejected'
+              : effectiveTargetStatus === ORDER_STATUS.PAYMENT_FAILED
+                ? 'payment_failed'
+                : effectiveTargetStatus === ORDER_STATUS.CANCELLED_PAYMENT
+                  ? 'payment_cancelled'
+                  : 'order_cancelled',
         },
       });
     }
