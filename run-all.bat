@@ -26,5 +26,6 @@ echo   Backend API   : http://localhost:4000/api/health
 echo.
 echo Runtime logs are stored in .runtime\logs.
 pause
---NGUYEN VAN A	9704 0000 0000 0018	03/07	OTP	Thành công
---4111111111111111	NGUYEN VAN A	01/28	123
+--NGUYEN VAN A 9704 0000 0000 0018  03/07   OTP Thành công                         
+--4111111111111111    NGUYEN VAN A    01/28   123                                                
+      --phai co kl cua chuong , 

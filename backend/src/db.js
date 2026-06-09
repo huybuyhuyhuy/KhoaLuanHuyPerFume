@@ -28,6 +28,26 @@ if (useSqlAuthentication) {
 
 let _pool = null;
 
+function padDatePart(value) {
+  return String(value).padStart(2, '0');
+}
+
+function toSqlDateTimeText(value) {
+  if (!value) return null;
+  const date = value instanceof Date ? value : new Date(String(value).trim());
+  if (Number.isNaN(date.getTime())) return null;
+
+  return [
+    date.getFullYear(),
+    padDatePart(date.getMonth() + 1),
+    padDatePart(date.getDate()),
+  ].join('-') + ' ' + [
+    padDatePart(date.getHours()),
+    padDatePart(date.getMinutes()),
+    padDatePart(date.getSeconds()),
+  ].join(':');
+}
+
 async function getPool() {
   if (!_pool) {
     _pool = await sql.connect(config);
@@ -170,7 +190,7 @@ async function query(rawSql, params = []) {
         request.input(key, sql.Float, value);
       }
     } else if (value instanceof Date) {
-      request.input(key, sql.DateTime2, value);
+      request.input(key, sql.NVarChar(19), toSqlDateTimeText(value));
     } else {
       request.input(key, sql.NVarChar, String(value));
     }
@@ -261,7 +281,7 @@ class FakeConnection {
           request.input(key, sql.Float, value);
         }
       } else if (value instanceof Date) {
-        request.input(key, sql.DateTime2, value);
+        request.input(key, sql.NVarChar(19), toSqlDateTimeText(value));
       } else {
         request.input(key, sql.NVarChar, String(value));
       }

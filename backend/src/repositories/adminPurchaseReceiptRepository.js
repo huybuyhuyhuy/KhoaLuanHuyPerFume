@@ -21,6 +21,26 @@ function safeJson(value) {
   }
 }
 
+function padDatePart(value) {
+  return String(value).padStart(2, '0');
+}
+
+function toSqlDateTimeText(value) {
+  if (!value) return null;
+  const date = value instanceof Date ? value : new Date(String(value).trim());
+  if (Number.isNaN(date.getTime())) return null;
+
+  return [
+    date.getFullYear(),
+    padDatePart(date.getMonth() + 1),
+    padDatePart(date.getDate()),
+  ].join('-') + ' ' + [
+    padDatePart(date.getHours()),
+    padDatePart(date.getMinutes()),
+    padDatePart(date.getSeconds()),
+  ].join(':');
+}
+
 function mapReceiptRow(row = {}) {
   return {
     purchaseReceiptId: Number(row.PurchaseReceiptId || row.purchaseReceiptId || 0),
@@ -79,7 +99,7 @@ function addInput(request, name, value, type = null) {
   }
   if (value === null || value === undefined) request.input(name, sql.NVarChar, null);
   else if (typeof value === 'number') request.input(name, Number.isInteger(value) ? sql.Int : sql.Decimal(18, 2), value);
-  else if (value instanceof Date) request.input(name, sql.DateTime2, value);
+  else if (value instanceof Date) request.input(name, sql.NVarChar(19), toSqlDateTimeText(value));
   else if (typeof value === 'boolean') request.input(name, sql.Bit, value ? 1 : 0);
   else request.input(name, sql.NVarChar, String(value));
 }
@@ -91,31 +111,136 @@ async function txQuery(transaction, sqlText, inputs = []) {
   }
   return request.query(sqlText);
 }
+async function namedQuery(sqlText, inputs = []) {
+  const pool = await getDbPool();
+  const request = pool.request();
 
+  for (const input of inputs) {
+    addInput(request, input.name, input.value, input.type || null);
+  }
+
+  const result = await request.query(sqlText);
+  return result.recordset || [];
+}
 async function getReceiptCapabilities() {
   if (!receiptCapabilitiesPromise) {
     receiptCapabilitiesPromise = (async () => {
-      const [tables, inventoryColumns] = await Promise.all([
+      const [tables, inventoryColumns, userColumns] = await Promise.all([
         query(`
           SELECT TABLE_NAME
           FROM INFORMATION_SCHEMA.TABLES
           WHERE TABLE_SCHEMA = 'dbo'
-            AND TABLE_NAME IN ('inventory_transactions', 'PurchaseReceipts', 'PurchaseReceiptItems')
+            AND TABLE_NAME IN ('inventory_transactions', 'PurchaseReceipts', 'PurchaseReceiptItems', 'users')
         `),
         query(`
           SELECT COLUMN_NAME
           FROM INFORMATION_SCHEMA.COLUMNS
           WHERE TABLE_SCHEMA = 'dbo' AND TABLE_NAME = 'inventory_transactions'
         `),
+        query(`
+          SELECT COLUMN_NAME
+          FROM INFORMATION_SCHEMA.COLUMNS
+          WHERE TABLE_SCHEMA = 'dbo' AND TABLE_NAME = 'users'
+        `),
       ]);
       const tableNames = new Set(tables.map((row) => String(row.TABLE_NAME || row.table_name || '').toLowerCase()));
       return {
+        hasUsers: tableNames.has('users'),
         hasInventoryTransactions: tableNames.has('inventory_transactions'),
         inventoryColumns: columnSet(inventoryColumns),
+        userColumns: columnSet(userColumns),
       };
     })();
   }
   return receiptCapabilitiesPromise;
+}
+
+function createdByJoin(capabilities) {
+  return capabilities?.hasUsers ? 'LEFT JOIN dbo.users u ON u.id = pr.CreatedBy' : '';
+}
+
+function createdByNameSelect(capabilities) {
+  if (!capabilities?.hasUsers) return "N'' AS CreatedByName";
+
+  const candidates = [];
+  if (hasColumn(capabilities.userColumns, 'name')) candidates.push("NULLIF(u.name, N'')");
+  if (hasColumn(capabilities.userColumns, 'full_name')) candidates.push("NULLIF(u.full_name, N'')");
+  if (hasColumn(capabilities.userColumns, 'email')) candidates.push("NULLIF(u.email, N'')");
+
+  return candidates.length
+    ? `COALESCE(${candidates.join(', ')}, N'') AS CreatedByName`
+    : "N'' AS CreatedByName";
+}
+
+function optionalColumn(columns, columnName, expression, alias, fallback = "N''") {
+  return `${hasColumn(columns, columnName) ? expression : fallback} AS ${alias}`;
+}
+
+async function invalidateChangedProductCaches(productIds) {
+  const ids = [...productIds].filter(Boolean);
+  if (!ids.length) return;
+
+  try {
+    await Promise.all(ids.map((productId) => invalidateProductCache(productId)));
+  } catch (error) {
+    console.warn('[PURCHASE_RECEIPT_CACHE_INVALIDATION_WARN]', error?.message || error);
+  }
+}
+
+function buildCreatedReceiptFallback({ purchaseReceiptId, receiptCode, supplier, data, preparedItems, totalAmount, adminId }) {
+  return {
+    receipt: {
+      purchaseReceiptId: Number(purchaseReceiptId || 0),
+      receiptCode,
+      supplierId: Number(data.supplierId || 0),
+      supplierCode: supplier.SupplierCode || '',
+      supplierName: supplier.SupplierName || '',
+      importDate: data.importDate || null,
+      totalQuantity: preparedItems.reduce((sum, item) => sum + Number(item.quantity || 0), 0),
+      totalAmount: Number(totalAmount || 0),
+      note: data.note || '',
+      status: 'COMPLETED',
+      createdBy: adminId || null,
+      createdByName: '',
+      createdAt: new Date().toISOString(),
+      updatedAt: null,
+    },
+    supplier: {
+      supplierId: Number(data.supplierId || 0),
+      supplierCode: supplier.SupplierCode || '',
+      supplierName: supplier.SupplierName || '',
+      representativeName: supplier.RepresentativeName || '',
+      phone: supplier.Phone || '',
+      email: supplier.Email || '',
+      address: supplier.Address || '',
+    },
+    items: preparedItems.map((item) => ({
+      purchaseReceiptItemId: 0,
+      purchaseReceiptId: Number(purchaseReceiptId || 0),
+      productId: Number(item.productId || 0),
+      productName: item.productName || '',
+      productSku: '',
+      variantId: item.variantId || null,
+      variantSku: '',
+      variantLabel: item.variantLabel || '',
+      variantType: '',
+      quantity: Number(item.quantity || 0),
+      importPrice: Number(item.importPrice || 0),
+      totalPrice: Number(item.totalPrice || 0),
+      note: item.note || '',
+      createdAt: null,
+    })),
+  };
+}
+
+async function getPurchaseReceiptByIdAfterCommit(id, fallbackFactory) {
+  try {
+    const detail = await getPurchaseReceiptById(id);
+    if (detail) return detail;
+  } catch (error) {
+    console.warn('[PURCHASE_RECEIPT_POST_COMMIT_READ_WARN]', error?.message || error);
+  }
+  return fallbackFactory();
 }
 
 export async function ensurePurchaseReceiptSchema() {
@@ -305,13 +430,11 @@ async function getSupplierForReceipt(transaction, supplierId) {
 
 async function getProductForReceipt(transaction, productId, capabilities) {
   const stockColumn = productStockColumn(capabilities);
-  if (!stockColumn) {
-    throw new Error('Schema products chưa có cột tồn kho.');
-  }
+  const stockSelect = stockColumn ? `p.${stockColumn}` : '0';
 
   const result = await txQuery(
     transaction,
-    `SELECT TOP 1 p.id, p.name, p.${stockColumn} AS stock
+    `SELECT TOP 1 p.id, p.name, ${stockSelect} AS stock
      FROM dbo.products p WITH (UPDLOCK, HOLDLOCK)
      WHERE p.id = @productId${activeProductFilter(capabilities, 'p')}`,
     [{ name: 'productId', value: productId, type: sql.Int }]
@@ -359,24 +482,29 @@ async function increaseStock(transaction, item, capabilities) {
     if (!variantStock) return null;
 
     const stockColumn = productStockColumn(capabilities);
-    const updates = [`${stockColumn} = ${stockColumn} + @quantity`];
-    if (stockColumn !== 'stock' && hasColumn(capabilities.productColumns, 'stock')) updates.push('stock = stock + @quantity');
-    if (stockColumn !== 'quantity' && hasColumn(capabilities.productColumns, 'quantity')) updates.push('quantity = quantity + @quantity');
-    if (hasColumn(capabilities.productColumns, 'updated_at')) updates.push('updated_at = SYSDATETIME()');
-    await txQuery(
-      transaction,
-      `UPDATE dbo.products
-       SET ${updates.join(', ')}
-       WHERE id = @productId`,
-      [
-        { name: 'quantity', value: item.quantity, type: sql.Int },
-        { name: 'productId', value: item.productId, type: sql.Int },
-      ]
-    );
+    if (stockColumn) {
+      const updates = [`${stockColumn} = ${stockColumn} + @quantity`];
+      if (stockColumn !== 'stock' && hasColumn(capabilities.productColumns, 'stock')) updates.push('stock = stock + @quantity');
+      if (stockColumn !== 'quantity' && hasColumn(capabilities.productColumns, 'quantity')) updates.push('quantity = quantity + @quantity');
+      if (hasColumn(capabilities.productColumns, 'updated_at')) updates.push('updated_at = SYSDATETIME()');
+      await txQuery(
+        transaction,
+        `UPDATE dbo.products
+         SET ${updates.join(', ')}
+         WHERE id = @productId`,
+        [
+          { name: 'quantity', value: item.quantity, type: sql.Int },
+          { name: 'productId', value: item.productId, type: sql.Int },
+        ]
+      );
+    }
     return variantStock;
   }
 
   const stockColumn = productStockColumn(capabilities);
+  if (!stockColumn) {
+    throw new Error('Schema products chưa có cột tồn kho.');
+  }
   const updates = [`${stockColumn} = ${stockColumn} + @quantity`];
   if (stockColumn !== 'stock' && hasColumn(capabilities.productColumns, 'stock')) updates.push('stock = stock + @quantity');
   if (stockColumn !== 'quantity' && hasColumn(capabilities.productColumns, 'quantity')) updates.push('quantity = quantity + @quantity');
@@ -415,24 +543,29 @@ async function decreaseStock(transaction, item, capabilities) {
     if (!variantStock) return null;
 
     const stockColumn = productStockColumn(capabilities);
-    const updates = [`${stockColumn} = ${stockColumn} - @quantity`];
-    if (stockColumn !== 'stock' && hasColumn(capabilities.productColumns, 'stock')) updates.push('stock = stock - @quantity');
-    if (stockColumn !== 'quantity' && hasColumn(capabilities.productColumns, 'quantity')) updates.push('quantity = quantity - @quantity');
-    if (hasColumn(capabilities.productColumns, 'updated_at')) updates.push('updated_at = SYSDATETIME()');
-    await txQuery(
-      transaction,
-      `UPDATE dbo.products
-       SET ${updates.join(', ')}
-       WHERE id = @productId AND ${stockColumn} >= @quantity`,
-      [
-        { name: 'quantity', value: item.quantity, type: sql.Int },
-        { name: 'productId', value: item.productId, type: sql.Int },
-      ]
-    );
+    if (stockColumn) {
+      const updates = [`${stockColumn} = ${stockColumn} - @quantity`];
+      if (stockColumn !== 'stock' && hasColumn(capabilities.productColumns, 'stock')) updates.push('stock = stock - @quantity');
+      if (stockColumn !== 'quantity' && hasColumn(capabilities.productColumns, 'quantity')) updates.push('quantity = quantity - @quantity');
+      if (hasColumn(capabilities.productColumns, 'updated_at')) updates.push('updated_at = SYSDATETIME()');
+      await txQuery(
+        transaction,
+        `UPDATE dbo.products
+         SET ${updates.join(', ')}
+         WHERE id = @productId AND ${stockColumn} >= @quantity`,
+        [
+          { name: 'quantity', value: item.quantity, type: sql.Int },
+          { name: 'productId', value: item.productId, type: sql.Int },
+        ]
+      );
+    }
     return variantStock;
   }
 
   const stockColumn = productStockColumn(capabilities);
+  if (!stockColumn) {
+    throw new Error('Schema products chưa có cột tồn kho.');
+  }
   const updates = [`${stockColumn} = ${stockColumn} - @quantity`];
   if (stockColumn !== 'stock' && hasColumn(capabilities.productColumns, 'stock')) updates.push('stock = stock - @quantity');
   if (stockColumn !== 'quantity' && hasColumn(capabilities.productColumns, 'quantity')) updates.push('quantity = quantity - @quantity');
@@ -478,12 +611,11 @@ async function recordInventoryMovement(transaction, entry) {
   add('reference_type', 'referenceType', entry.referenceType || null, sql.NVarChar(50));
   add('reference_id', 'referenceId', entry.referenceId || null, sql.Int);
   add('performed_by', 'performedBy', entry.performedBy || null, sql.Int);
-  add('metadata', 'metadata', safeJson(entry.metadata || {}), sql.NVarChar(sql.MAX));
+  add('metadata', 'metadata', safeJson(entry.metadata || {}), sql.NVarChar(4000));
 
   if (!columns.length) return;
   await txQuery(transaction, `INSERT INTO dbo.inventory_transactions (${columns.join(', ')}) VALUES (${values.join(', ')})`, inputs);
 }
-
 export async function listPurchaseReceipts({
   search = '',
   supplierId = null,
@@ -496,51 +628,84 @@ export async function listPurchaseReceipts({
   pageSize = 10,
 } = {}) {
   await ensurePurchaseReceiptSchema();
+  const receiptCapabilities = await getReceiptCapabilities();
+
   const safePage = Math.max(1, Number(page) || 1);
   const safePageSize = Math.max(1, Math.min(100, Number(pageSize) || 10));
   const offset = (safePage - 1) * safePageSize;
+
   const conditions = ['pr.IsDeleted = 0'];
-  const params = [];
+  const inputs = [
+    { name: 'offset', value: offset, type: sql.Int },
+    { name: 'pageSize', value: safePageSize, type: sql.Int },
+  ];
 
   if (search) {
-    conditions.push('(pr.ReceiptCode LIKE ? OR s.SupplierName LIKE ? OR s.SupplierCode LIKE ?)');
-    params.push(`%${search}%`, `%${search}%`, `%${search}%`);
+    conditions.push('(pr.ReceiptCode LIKE @search OR s.SupplierName LIKE @search OR s.SupplierCode LIKE @search)');
+    inputs.push({
+      name: 'search',
+      value: `%${search}%`,
+      type: sql.NVarChar(255),
+    });
   }
+
   if (supplierId) {
-    conditions.push('pr.SupplierId = ?');
-    params.push(Number(supplierId));
+    conditions.push('pr.SupplierId = @supplierId');
+    inputs.push({
+      name: 'supplierId',
+      value: Number(supplierId),
+      type: sql.Int,
+    });
   }
+
   if (status) {
-    conditions.push('pr.Status = ?');
-    params.push(status);
+    conditions.push('pr.Status = @status');
+    inputs.push({
+      name: 'status',
+      value: status,
+      type: sql.NVarChar(30),
+    });
   }
+
   if (dateFrom) {
-    conditions.push('pr.ImportDate >= ?');
-    params.push(dateFrom);
+    conditions.push('pr.ImportDate >= CONVERT(DATETIME2, @dateFrom, 120)');
+    inputs.push({
+      name: 'dateFrom',
+      value: toSqlDateTimeText(dateFrom),
+      type: sql.NVarChar(19),
+    });
   }
+
   if (dateTo) {
-    conditions.push('pr.ImportDate < DATEADD(day, 1, ?)');
-    params.push(dateTo);
+    conditions.push('pr.ImportDate < DATEADD(day, 1, CONVERT(DATETIME2, @dateTo, 120))');
+    inputs.push({
+      name: 'dateTo',
+      value: toSqlDateTimeText(dateTo),
+      type: sql.NVarChar(19),
+    });
   }
 
   const whereSql = `WHERE ${conditions.join(' AND ')}`;
-  const totalRows = await query(
+
+  const totalInputs = inputs.filter((input) => !['offset', 'pageSize'].includes(input.name));
+
+  const totalRows = await namedQuery(
     `SELECT COUNT(*) AS total
      FROM dbo.PurchaseReceipts pr
      JOIN dbo.Suppliers s ON s.SupplierId = pr.SupplierId
      ${whereSql}`,
-    params
+    totalInputs
   );
 
-  const rows = await query(
+  const rows = await namedQuery(
     `SELECT pr.PurchaseReceiptId, pr.ReceiptCode, pr.SupplierId, pr.ImportDate, pr.ReceiptDate,
             pr.TotalAmount, pr.Note, pr.Status, pr.CreatedBy, pr.CreatedAt, pr.UpdatedAt,
             s.SupplierCode, s.SupplierName,
             COALESCE(itemStats.TotalQuantity, 0) AS TotalQuantity,
-            COALESCE(u.name, u.email, '') AS CreatedByName
+            ${createdByNameSelect(receiptCapabilities)}
      FROM dbo.PurchaseReceipts pr
      JOIN dbo.Suppliers s ON s.SupplierId = pr.SupplierId
-     LEFT JOIN dbo.users u ON u.id = pr.CreatedBy
+     ${createdByJoin(receiptCapabilities)}
      OUTER APPLY (
        SELECT SUM(Quantity) AS TotalQuantity
        FROM dbo.PurchaseReceiptItems pri
@@ -548,11 +713,12 @@ export async function listPurchaseReceipts({
      ) itemStats
      ${whereSql}
      ORDER BY ${sortExpression(sortBy, sortOrder)}
-     OFFSET ? ROWS FETCH NEXT ? ROWS ONLY`,
-    [...params, offset, safePageSize]
+     OFFSET @offset ROWS FETCH NEXT @pageSize ROWS ONLY`,
+    inputs
   );
 
   const totalItems = Number(totalRows[0]?.total || 0);
+
   return {
     items: rows.map(mapReceiptRow),
     pagination: {
@@ -563,18 +729,21 @@ export async function listPurchaseReceipts({
     },
   };
 }
-
 export async function getPurchaseReceiptById(id) {
   await ensurePurchaseReceiptSchema();
+  const [receiptCapabilities, productCapabilities] = await Promise.all([
+    getReceiptCapabilities(),
+    getProductStorageCapabilities(),
+  ]);
   const rows = await query(
     `SELECT pr.PurchaseReceiptId, pr.ReceiptCode, pr.SupplierId, pr.ImportDate, pr.ReceiptDate,
             pr.TotalAmount, pr.Note, pr.Status, pr.CreatedBy, pr.CreatedAt, pr.UpdatedAt,
             s.SupplierCode, s.SupplierName, s.RepresentativeName, s.Phone, s.Email, s.Address,
             COALESCE(itemStats.TotalQuantity, 0) AS TotalQuantity,
-            COALESCE(u.name, u.email, '') AS CreatedByName
+            ${createdByNameSelect(receiptCapabilities)}
      FROM dbo.PurchaseReceipts pr
      JOIN dbo.Suppliers s ON s.SupplierId = pr.SupplierId
-     LEFT JOIN dbo.users u ON u.id = pr.CreatedBy
+     ${createdByJoin(receiptCapabilities)}
      OUTER APPLY (
        SELECT SUM(Quantity) AS TotalQuantity
        FROM dbo.PurchaseReceiptItems pri
@@ -586,14 +755,27 @@ export async function getPurchaseReceiptById(id) {
   const row = rows[0];
   if (!row) return null;
 
+  const productSkuSelect = optionalColumn(productCapabilities.productColumns, 'sku', 'p.sku', 'ProductSku');
+  const hasVariants = productCapabilities.hasVariants;
+  const variantJoin = hasVariants ? 'LEFT JOIN dbo.product_variants pv ON pv.id = pri.VariantId' : '';
+  const variantSkuSelect = hasVariants
+    ? optionalColumn(productCapabilities.variantColumns, 'sku', 'pv.sku', 'VariantSku')
+    : "N'' AS VariantSku";
+  const variantLabelSelect = hasVariants
+    ? optionalColumn(productCapabilities.variantColumns, 'volume_label', 'pv.volume_label', 'VariantLabel')
+    : "N'' AS VariantLabel";
+  const variantTypeSelect = hasVariants
+    ? optionalColumn(productCapabilities.variantColumns, 'variant_type', 'pv.variant_type', 'VariantType')
+    : "N'' AS VariantType";
+
   const items = await query(
     `SELECT pri.PurchaseReceiptItemId, pri.PurchaseReceiptId, pri.ProductId, pri.VariantId,
             pri.Quantity, pri.ImportPrice, pri.TotalPrice, pri.Note, pri.CreatedAt,
-            p.name AS ProductName, p.sku AS ProductSku,
-            pv.sku AS VariantSku, pv.volume_label AS VariantLabel, pv.variant_type AS VariantType
+            p.name AS ProductName, ${productSkuSelect},
+            ${variantSkuSelect}, ${variantLabelSelect}, ${variantTypeSelect}
      FROM dbo.PurchaseReceiptItems pri
      JOIN dbo.products p ON p.id = pri.ProductId
-     LEFT JOIN dbo.product_variants pv ON pv.id = pri.VariantId
+     ${variantJoin}
      WHERE pri.PurchaseReceiptId = ?
      ORDER BY pri.PurchaseReceiptItemId ASC`,
     [id]
@@ -675,13 +857,13 @@ export async function createPurchaseReceipt(data, adminId = null) {
        (ReceiptCode, SupplierId, ImportDate, ReceiptDate, TotalAmount, Note, Status, CreatedBy, CreatedAt, IsDeleted)
        OUTPUT inserted.PurchaseReceiptId AS PurchaseReceiptId
        VALUES
-       (@receiptCode, @supplierId, @importDate, @importDate, @totalAmount, @note, N'COMPLETED', @createdBy, SYSDATETIME(), 0)`,
+       (@receiptCode, @supplierId, CONVERT(DATETIME2, @importDate, 120), CONVERT(DATETIME2, @importDate, 120), @totalAmount, @note, N'COMPLETED', @createdBy, SYSDATETIME(), 0)`,
       [
         { name: 'receiptCode', value: receiptCode, type: sql.NVarChar(30) },
         { name: 'supplierId', value: data.supplierId, type: sql.Int },
-        { name: 'importDate', value: data.importDate, type: sql.DateTime2 },
+        { name: 'importDate', value: toSqlDateTimeText(data.importDate), type: sql.NVarChar(19) },
         { name: 'totalAmount', value: totalAmount, type: sql.Decimal(18, 2) },
-        { name: 'note', value: data.note || null, type: sql.NVarChar(sql.MAX) },
+        { name: 'note', value: data.note || null, type: sql.NVarChar(4000) },
         { name: 'createdBy', value: adminId || null, type: sql.Int },
       ]
     );
@@ -736,10 +918,18 @@ export async function createPurchaseReceipt(data, adminId = null) {
     }
 
     await transaction.commit();
-    await Promise.all([...changedProductIds].map((productId) => invalidateProductCache(productId)));
-    return getPurchaseReceiptById(purchaseReceiptId);
+    await invalidateChangedProductCaches(changedProductIds);
+    return getPurchaseReceiptByIdAfterCommit(purchaseReceiptId, () => buildCreatedReceiptFallback({
+      purchaseReceiptId,
+      receiptCode,
+      supplier,
+      data,
+      preparedItems,
+      totalAmount,
+      adminId,
+    }));
   } catch (error) {
-    try { await transaction.rollback(); } catch {}
+    try { await transaction.rollback(); } catch { }
     throw error;
   }
 }
@@ -849,10 +1039,37 @@ export async function cancelPurchaseReceipt(id, adminId = null) {
     );
 
     await transaction.commit();
-    await Promise.all([...changedProductIds].map((productId) => invalidateProductCache(productId)));
-    return getPurchaseReceiptById(id);
+    await invalidateChangedProductCaches(changedProductIds);
+    return getPurchaseReceiptByIdAfterCommit(id, () => ({
+      receipt: {
+        purchaseReceiptId: Number(id || 0),
+        receiptCode: receipt.ReceiptCode || '',
+        supplierId: Number(receipt.SupplierId || 0),
+        supplierCode: '',
+        supplierName: '',
+        importDate: null,
+        totalQuantity: 0,
+        totalAmount: 0,
+        note: '',
+        status: 'CANCELLED',
+        createdBy: null,
+        createdByName: '',
+        createdAt: null,
+        updatedAt: new Date().toISOString(),
+      },
+      supplier: {
+        supplierId: Number(receipt.SupplierId || 0),
+        supplierCode: '',
+        supplierName: '',
+        representativeName: '',
+        phone: '',
+        email: '',
+        address: '',
+      },
+      items: [],
+    }));
   } catch (error) {
-    try { await transaction.rollback(); } catch {}
+    try { await transaction.rollback(); } catch { }
     throw error;
   }
 }
@@ -965,14 +1182,20 @@ export async function listReceiptProductOptions({ search = '', limit = 100 } = {
   if (hasColumn(capabilities.productColumns, 'deleted_at')) conditions.push('p.deleted_at IS NULL');
   if (hasColumn(capabilities.productColumns, 'status')) conditions.push('ISNULL(p.status, 1) = 1');
   if (search) {
-    conditions.push('(p.name LIKE ? OR p.sku LIKE ?)');
-    params.push(`%${search}%`, `%${search}%`);
+    const searchColumns = ['p.name LIKE ?'];
+    params.push(`%${search}%`);
+    if (hasColumn(capabilities.productColumns, 'sku')) {
+      searchColumns.push('p.sku LIKE ?');
+      params.push(`%${search}%`);
+    }
+    conditions.push(`(${searchColumns.join(' OR ')})`);
   }
 
+  const productSkuSelect = optionalColumn(capabilities.productColumns, 'sku', 'p.sku', 'sku');
   const imageSelect = hasColumn(capabilities.productColumns, 'image') ? 'p.image' : 'NULL';
   const priceSelect = hasColumn(capabilities.productColumns, 'price') ? 'p.price' : '0';
   const rows = await query(
-    `SELECT TOP ${safeLimit} p.id, p.name, p.sku, ${imageSelect} AS image,
+    `SELECT TOP ${safeLimit} p.id, p.name, ${productSkuSelect}, ${imageSelect} AS image,
             ${priceSelect} AS price, ${stockColumn || '0'} AS stock
      FROM dbo.products p
      WHERE ${conditions.join(' AND ')}
@@ -989,11 +1212,12 @@ export async function listReceiptProductOptions({ search = '', limit = 100 } = {
     if (hasColumn(capabilities.variantColumns, 'deleted_at')) variantFilters.push('deleted_at IS NULL');
     if (hasColumn(capabilities.variantColumns, 'status')) variantFilters.push('ISNULL(status, 1) = 1');
     if (hasColumn(capabilities.variantColumns, 'variant_type')) variantFilters.push("UPPER(ISNULL(variant_type, N'FULL')) <> N'DECANT'");
+    const variantSkuSelect = hasColumn(capabilities.variantColumns, 'sku') ? 'sku' : "N'' AS sku";
     const volumeLabelSelect = hasColumn(capabilities.variantColumns, 'volume_label') ? 'volume_label' : 'NULL AS volume_label';
     const variantTypeSelect = hasColumn(capabilities.variantColumns, 'variant_type') ? 'variant_type' : 'NULL AS variant_type';
     const sortSelect = hasColumn(capabilities.variantColumns, 'sort_order') ? 'sort_order' : '0 AS sort_order';
     variants = await query(
-      `SELECT id, product_id, sku, ${volumeLabelSelect}, ${variantTypeSelect}, stock_quantity, ${sortSelect}
+      `SELECT id, product_id, ${variantSkuSelect}, ${volumeLabelSelect}, ${variantTypeSelect}, stock_quantity, ${sortSelect}
        FROM dbo.product_variants
        WHERE ${variantFilters.join(' AND ')}
        ORDER BY product_id, sort_order, id`,

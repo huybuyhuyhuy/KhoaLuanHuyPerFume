@@ -317,7 +317,7 @@ export async function createSupplier(data, updatedBy = null) {
     request.input('phone', sql.NVarChar(30), data.phone);
     request.input('email', sql.NVarChar(255), data.email);
     request.input('address', sql.NVarChar(500), data.address || null);
-    request.input('note', sql.NVarChar(sql.MAX), data.note || null);
+    request.input('note', sql.NVarChar(4000), data.note || null);
     request.input('status', sql.NVarChar(30), data.status || 'ACTIVE');
     request.input('updatedBy', sql.Int, updatedBy || null);
 
@@ -331,8 +331,8 @@ export async function createSupplier(data, updatedBy = null) {
     const newValue = { ...data, supplierCode };
     request.input('supplierId', sql.Int, supplierId);
     request.input('actionType', sql.NVarChar(50), 'CREATE');
-    request.input('oldValue', sql.NVarChar(sql.MAX), null);
-    request.input('newValue', sql.NVarChar(sql.MAX), safeJson(newValue));
+    request.input('oldValue', sql.NVarChar(4000), null);
+    request.input('newValue', sql.NVarChar(4000), safeJson(newValue));
     await request.query(
       `INSERT INTO dbo.SupplierUpdateHistory
        (SupplierId, ActionType, OldValue, NewValue, UpdatedBy)

@@ -92,7 +92,31 @@ function paymentReturnAutoConfirmEnabled() {
   return envFlag('PAYMENT_RETURN_AUTO_CONFIRM', process.env.NODE_ENV !== 'production');
 }
 
+function zaloPayAppTransDate() {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Ho_Chi_Minh',
+    year: '2-digit',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(new Date());
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${values.year}${values.month}${values.day}`;
+}
+
 const MOMO_UAT_REJECTED_MESSAGE = 'Thanh toán MoMo UAT bị từ chối bởi phương thức thanh toán test. Vui lòng thử lại hoặc chọn ZaloPay/COD.';
+const PAID_ORDER_STATUSES = new Set([
+  ORDER_STATUS.CONFIRMED,
+  ORDER_STATUS.PACKING,
+  ORDER_STATUS.SHIPPING,
+  ORDER_STATUS.DELIVERED,
+  ORDER_STATUS.COMPLETED,
+]);
+const PAYMENT_RECOVERABLE_STATUSES = new Set([
+  ORDER_STATUS.PENDING_PAYMENT,
+  ORDER_STATUS.PENDING,
+  ORDER_STATUS.PAYMENT_REJECTED,
+  ORDER_STATUS.PAYMENT_FAILED,
+]);
 
 function normalizeGatewayText(value) {
   return String(value || '')
@@ -146,7 +170,7 @@ function logMomoGatewayResponse(event, payload) {
 function ensurePayableOrder(order, expectedPaymentMethod) {
   const status = normalizeOrderStatus(order.status);
   const paymentStatus = String(order.payment_status || '').trim().toUpperCase();
-  if (paymentStatus === 'PAID' || status === ORDER_STATUS.CONFIRMED) {
+  if (paymentStatus === 'PAID' || PAID_ORDER_STATUSES.has(status)) {
     return { code: 409, message: 'Đơn hàng đã được thanh toán' };
   }
   if ([ORDER_STATUS.CANCELLED_PAYMENT, ORDER_STATUS.CANCELLED, ORDER_STATUS.REFUNDED].includes(status) || paymentStatus === 'CANCELLED') {
@@ -314,7 +338,7 @@ async function updatePaidOrder({ orderId, userId = null, expectedPaymentMethod =
   if (!order) return { code: 404, message: 'Không tìm thấy đơn hàng' };
   const currentStatus = normalizeOrderStatus(order.status);
   const paymentStatus = String(order.payment_status || '').trim().toUpperCase();
-  if (paymentStatus === 'PAID' || currentStatus === ORDER_STATUS.CONFIRMED) {
+  if (paymentStatus === 'PAID' && PAID_ORDER_STATUSES.has(currentStatus)) {
     return { ok: true, status: currentStatus, paymentStatus: 'PAID' };
   }
   if ([ORDER_STATUS.CANCELLED_PAYMENT, ORDER_STATUS.CANCELLED, ORDER_STATUS.REFUNDED].includes(currentStatus) || paymentStatus === 'CANCELLED') {
@@ -339,11 +363,13 @@ async function updatePaidOrder({ orderId, userId = null, expectedPaymentMethod =
     params.push(orderId);
     await query(`UPDATE orders SET ${assignments.join(', ')} WHERE id = ?`, params);
   }
-  if ([ORDER_STATUS.PENDING_PAYMENT, ORDER_STATUS.PENDING].includes(currentStatus)) {
+  if (PAYMENT_RECOVERABLE_STATUSES.has(currentStatus)) {
+    const methodLabel = String(expectedPaymentMethod || order.payment_method || 'ONLINE').toUpperCase();
     const result = await updateOrderStatusWithHistory({
       orderId,
       newStatus: ORDER_STATUS.CONFIRMED,
-      note: `${String(order.payment_method || 'ONLINE').toUpperCase()} thanh toán thành công`,
+      note: `${methodLabel} thanh toán thành công`,
+      allowAnyTransition: ![ORDER_STATUS.PENDING_PAYMENT, ORDER_STATUS.PENDING].includes(currentStatus),
     });
     if (result.code) return result;
     if (order.user_id) {
@@ -351,10 +377,10 @@ async function updatePaidOrder({ orderId, userId = null, expectedPaymentMethod =
     }
     return { ...result, status: ORDER_STATUS.CONFIRMED };
   }
-  if (currentStatus === ORDER_STATUS.CONFIRMED && order.user_id) {
+  if (PAID_ORDER_STATUSES.has(currentStatus) && order.user_id) {
     await markCartCheckedOut({ type: 'user', key: order.user_id });
   }
-  return { ok: true, status: currentStatus };
+  return { ok: true, status: currentStatus, paymentStatus: 'PAID' };
 }
 
 async function rememberGatewayReference({ orderId, paymentMethod = null, momoOrderId = null, zalopayAppTransId = null, clearFailureReason = false }) {
@@ -417,6 +443,20 @@ function zaloPayReturnStatus(resultCode) {
   return 'failed';
 }
 
+function hasSuccessfulZaloPayReturnSignal(req) {
+  const successKeys = [
+    'resultcode',
+    'resultCode',
+    'returncode',
+    'return_code',
+    'status',
+  ];
+  return successKeys.some((key) => (
+    Object.prototype.hasOwnProperty.call(req.query || {}, key)
+    && zaloPayReturnStatus(req.query[key]) === 'success'
+  ));
+}
+
 async function markPaymentNotPaidOrder({
   orderId,
   expectedPaymentMethod,
@@ -431,7 +471,7 @@ async function markPaymentNotPaidOrder({
 
   const currentStatus = normalizeOrderStatus(order.status);
   const currentPaymentStatus = String(order.payment_status || '').trim().toUpperCase();
-  if (currentPaymentStatus === 'PAID' || currentStatus === ORDER_STATUS.CONFIRMED) {
+  if (currentPaymentStatus === 'PAID' || PAID_ORDER_STATUSES.has(currentStatus)) {
     return { ok: true, status: ORDER_STATUS.CONFIRMED, paymentStatus: 'PAID' };
   }
   if ([ORDER_STATUS.CANCELLED_PAYMENT, ORDER_STATUS.CANCELLED, ORDER_STATUS.REFUNDED].includes(currentStatus) || currentPaymentStatus === 'CANCELLED') {
@@ -814,8 +854,7 @@ export async function createZaloPay(req, res) {
     if (config.code) {
       if (!paymentMockEnabled()) return errorResponse(res, config.code, config.message);
 
-      const now = new Date();
-      const yymmdd = now.toISOString().slice(2, 10).replace(/-/g, '');
+      const yymmdd = zaloPayAppTransDate();
       const amount = Math.round(Number(order.total || 0));
       const attempt = await createPaymentAttempt({ orderId, provider: 'ZALOPAY', amount });
       const appTransId = `${yymmdd}_${attempt.requestId}`;
@@ -844,8 +883,7 @@ export async function createZaloPay(req, res) {
       });
     }
 
-    const now = new Date();
-    const yymmdd = now.toISOString().slice(2, 10).replace(/-/g, '');
+    const yymmdd = zaloPayAppTransDate();
     const amount = Math.round(Number(order.total || 0));
     const attempt = await createPaymentAttempt({ orderId, provider: 'ZALOPAY', amount });
     const appTransId = `${yymmdd}_${attempt.requestId}`;
@@ -985,7 +1023,8 @@ export async function zaloPayReturn(req, res) {
     const resultCodeRaw = req.query.resultcode ?? req.query.resultCode ?? req.query.returncode ?? req.query.return_code ?? req.query.status;
     const isMockReturn = String(req.query.mock || '') === '1';
     const returnedStatus = resultCodeRaw === undefined ? 'pending' : zaloPayReturnStatus(resultCodeRaw);
-    const trustSuccessfulReturn = paymentReturnAutoConfirmEnabled() && returnedStatus === 'success';
+    const trustSuccessfulReturn = paymentReturnAutoConfirmEnabled()
+      && (returnedStatus === 'success' || hasSuccessfulZaloPayReturnSignal(req));
     let status = returnedStatus;
     let verificationResponse = null;
 
@@ -995,9 +1034,13 @@ export async function zaloPayReturn(req, res) {
         try {
           const queryResult = await queryZaloPayOrder(config, appTransId);
           verificationResponse = queryResult.body || null;
-          status = trustSuccessfulReturn && queryResult.status !== 'success'
-            ? 'success'
-            : queryResult.status;
+          if (trustSuccessfulReturn) {
+            status = 'success';
+          } else if (returnedStatus === 'pending' && queryResult.status === 'failed') {
+            status = 'pending';
+          } else {
+            status = queryResult.status;
+          }
         } catch (error) {
           verificationResponse = { error: error.message };
           if (!trustSuccessfulReturn) throw error;

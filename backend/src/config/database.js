@@ -33,6 +33,26 @@ if (useSqlAuthentication) {
 
 let poolPromise = null;
 
+function padDatePart(value) {
+  return String(value).padStart(2, '0');
+}
+
+function toSqlDateTimeText(value) {
+  if (!value) return null;
+  const date = value instanceof Date ? value : new Date(String(value).trim());
+  if (Number.isNaN(date.getTime())) return null;
+
+  return [
+    date.getFullYear(),
+    padDatePart(date.getMonth() + 1),
+    padDatePart(date.getDate()),
+  ].join('-') + ' ' + [
+    padDatePart(date.getHours()),
+    padDatePart(date.getMinutes()),
+    padDatePart(date.getSeconds()),
+  ].join(':');
+}
+
 export async function getDbPool() {
   if (!poolPromise) {
     poolPromise = sql.connect(config);
@@ -53,7 +73,7 @@ export async function query(sqlText, params = []) {
     } else if (typeof value === 'number') {
       request.input(name, Number.isInteger(value) ? sql.Int : sql.Float, value);
     } else if (value instanceof Date) {
-      request.input(name, sql.DateTime2, value);
+      request.input(name, sql.NVarChar(19), toSqlDateTimeText(value));
     } else {
       request.input(name, sql.NVarChar, String(value));
     }

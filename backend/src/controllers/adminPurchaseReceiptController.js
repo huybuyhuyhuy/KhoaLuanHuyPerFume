@@ -13,10 +13,22 @@ import { errorResponse, successResponse } from '../utils/response.js';
 import { buildAuditContext, writeAdminAuditLog } from '../utils/adminAuditLogger.js';
 
 function handlePurchaseReceiptError(res, error, fallback) {
+  console.error('[PURCHASE_RECEIPT_ERROR]', {
+    name: error?.name,
+    status: error?.status,
+    message: error?.message,
+    details: error?.details,
+    stack: error?.stack,
+  });
+
   if (error instanceof PurchaseReceiptServiceError) {
     return errorResponse(res, error.status, error.message, error.details || {});
   }
-  return errorResponse(res, 500, fallback, { message: error?.message || fallback });
+
+  return errorResponse(res, 500, fallback, {
+    message: error?.message || fallback,
+    stack: process.env.NODE_ENV === 'development' ? error?.stack : undefined,
+  });
 }
 
 async function writePurchaseReceiptAudit(req, action, detail = null, oldValue = null) {
@@ -69,6 +81,8 @@ export async function purchaseReceiptDetail(req, res) {
 
 export async function createPurchaseReceipt(req, res) {
   try {
+    console.log('[CREATE_PURCHASE_RECEIPT_PAYLOAD]', JSON.stringify(req.body, null, 2));
+
     const data = await createPurchaseReceiptService(req.body, req.user?.id || null);
     await writePurchaseReceiptAudit(req, 'PURCHASE_RECEIPT_CREATE', data);
     return successResponse(res, 'Tạo phiếu nhập và cộng tồn kho thành công', data, 201);

@@ -40,12 +40,14 @@ function normalizeGatewayValue(value?: string | null) {
   return String(value || '').trim().toUpperCase();
 }
 
-function isPaidZaloPayOrder(order: any) {
+function isPaidOnlineOrder(order: any, payment: string) {
   if (!order) return false;
+  const expectedMethod = normalizeGatewayValue(payment);
   const method = normalizeGatewayValue(order.paymentMethod ?? order.payment_method);
   const paymentStatus = normalizeGatewayValue(order.paymentStatus ?? order.payment_status);
   const orderStatus = normalizeGatewayValue(order.status);
-  return method === 'ZALOPAY' && (paymentStatus === 'PAID' || PAID_ORDER_STATUSES.has(orderStatus));
+  if (expectedMethod && method && method !== expectedMethod) return false;
+  return paymentStatus === 'PAID' || PAID_ORDER_STATUSES.has(orderStatus);
 }
 
 function isRecentPaymentRecoveryCandidate(order: any) {
@@ -65,7 +67,10 @@ export function PaymentReturnPage() {
   const status = String(searchParams.get('status') || 'failed').toLowerCase();
   const rawOrderId = searchParams.get('orderId');
   const resultCode = searchParams.get('resultCode');
-  const pendingReturn = useMemo(() => payment === 'zalopay' ? readPendingPaymentReturn('ZALOPAY') : null, [payment]);
+  const pendingReturn = useMemo(() => {
+    if (!['momo', 'zalopay'].includes(payment)) return null;
+    return readPendingPaymentReturn(payment.toUpperCase());
+  }, [payment]);
   const storedOrderId = pendingReturn?.orderId ? String(pendingReturn.orderId) : null;
   const orderId = recoveredOrderId || rawOrderId || storedOrderId;
   const effectiveStatus = recoveredStatus || status;
@@ -76,7 +81,8 @@ export function PaymentReturnPage() {
   }, [effectiveStatus, verifyingReturn]);
   const message = useMemo(() => {
     if (verifyingReturn && effectiveStatus !== 'success') {
-      return 'Đang kiểm tra lại trạng thái ZaloPay từ đơn hàng của bạn. Vui lòng chờ trong giây lát.';
+      const methodLabel = payment === 'zalopay' ? 'ZaloPay Sandbox' : 'MoMo UAT';
+      return `Đang kiểm tra lại trạng thái ${methodLabel} từ đơn hàng của bạn. Vui lòng chờ trong giây lát.`;
     }
     return getStatusMessage(effectiveStatus, payment, resultCode);
   }, [effectiveStatus, payment, resultCode, verifyingReturn]);
@@ -115,12 +121,12 @@ export function PaymentReturnPage() {
   }, [payment, rawOrderId, status]);
 
   useEffect(() => {
-    if (payment !== 'zalopay' || status === 'success') return undefined;
+    if (!['momo', 'zalopay'].includes(payment) || status === 'success') return undefined;
 
     let active = true;
 
     const recoverFromOrder = (order: any) => {
-      if (!active || !isPaidZaloPayOrder(order)) return false;
+      if (!active || !isPaidOnlineOrder(order, payment)) return false;
       const nextOrderId = order?.id ? String(order.id) : orderId;
       if (nextOrderId) setRecoveredOrderId(nextOrderId);
       setRecoveredStatus('success');
@@ -128,10 +134,10 @@ export function PaymentReturnPage() {
       return true;
     };
 
-    const verifyZaloPayReturn = async () => {
+    const verifyPaymentReturn = async () => {
       setVerifyingReturn(true);
       try {
-        const pendingPayment = readPendingPaymentReturn('ZALOPAY');
+        const pendingPayment = readPendingPaymentReturn(payment.toUpperCase());
         const candidateOrderId = rawOrderId || pendingPayment?.orderId;
         const candidateOrderNumber = Number(candidateOrderId);
 
@@ -146,7 +152,7 @@ export function PaymentReturnPage() {
 
         const orders = await orderService.getUserOrders();
         const recoveredOrder = Array.isArray(orders)
-          ? orders.find((order) => isPaidZaloPayOrder(order) && isRecentPaymentRecoveryCandidate(order))
+          ? orders.find((order) => isPaidOnlineOrder(order, payment) && isRecentPaymentRecoveryCandidate(order))
           : null;
         if (recoveredOrder) recoverFromOrder(recoveredOrder);
       } catch {
@@ -156,7 +162,7 @@ export function PaymentReturnPage() {
       }
     };
 
-    verifyZaloPayReturn();
+    verifyPaymentReturn();
 
     return () => {
       active = false;

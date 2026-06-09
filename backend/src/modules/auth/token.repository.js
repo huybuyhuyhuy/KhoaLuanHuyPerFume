@@ -16,6 +16,26 @@ function isExpired(value) {
   return new Date(value).getTime() <= Date.now();
 }
 
+function padDatePart(value) {
+  return String(value).padStart(2, '0');
+}
+
+function toSqlDateTimeText(value) {
+  if (!value) return null;
+  const date = value instanceof Date ? value : new Date(String(value).trim());
+  if (Number.isNaN(date.getTime())) return null;
+
+  return [
+    date.getFullYear(),
+    padDatePart(date.getMonth() + 1),
+    padDatePart(date.getDate()),
+  ].join('-') + ' ' + [
+    padDatePart(date.getHours()),
+    padDatePart(date.getMinutes()),
+    padDatePart(date.getSeconds()),
+  ].join(':');
+}
+
 function tokenPair() {
   const token = generateSecureToken(48);
   return { token, tokenHash: sha256Hex(token) };
@@ -138,12 +158,12 @@ export async function rotateRefreshToken(rawToken, user, context = {}) {
     insertRequest.input('issuedJti', sql.UniqueIdentifier, randomUUID());
     insertRequest.input('userAgent', sql.NVarChar, context.userAgent || '');
     insertRequest.input('ipAddress', sql.NVarChar, context.ipAddress || '');
-    insertRequest.input('expiresAt', sql.DateTime2, new Date(expiresAt));
+    insertRequest.input('expiresAt', sql.NVarChar(19), toSqlDateTimeText(expiresAt));
     const insertResult = await insertRequest.query(
       `INSERT INTO refresh_tokens
          (user_id, token_hash, family_id, issued_jti, user_agent, ip_address, expires_at)
        OUTPUT INSERTED.id AS id
-       VALUES (@userId, @tokenHash, @familyId, @issuedJti, @userAgent, @ipAddress, @expiresAt)`
+       VALUES (@userId, @tokenHash, @familyId, @issuedJti, @userAgent, @ipAddress, CONVERT(DATETIME2, @expiresAt, 120))`
     );
     const nextId = insertResult.recordset?.[0]?.id;
 

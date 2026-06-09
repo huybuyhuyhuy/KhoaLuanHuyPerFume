@@ -74,34 +74,34 @@ function summarizeProduct(product, filters = {}) {
     availableVolumeMl: displayProduct.availableVolumeMl ?? null,
     decantOptions: Array.isArray(displayProduct.decantOptions)
       ? displayProduct.decantOptions.map((option) => ({
-          id: option.id,
-          volumeMl: option.volumeMl,
-          price: option.price,
-          status: option.status !== false,
-        }))
+        id: option.id,
+        volumeMl: option.volumeMl,
+        price: option.price,
+        status: option.status !== false,
+      }))
       : [],
     status: displayProduct.status,
     selectedVariant: displayProduct.selectedVariant
       ? {
-          id: displayProduct.selectedVariant.id,
-          label: displayProduct.selectedVariant.label,
-          volumeMl: displayProduct.selectedVariant.volumeMl ?? null,
-          type: displayProduct.selectedVariant.type || '',
-          effectivePrice: displayProduct.selectedVariant.effectivePrice ?? null,
-          stock: displayProduct.selectedVariant.stock ?? displayProduct.selectedVariant.stockQuantity ?? 0,
-          isAvailable: Boolean(displayProduct.selectedVariant.isAvailable),
-        }
+        id: displayProduct.selectedVariant.id,
+        label: displayProduct.selectedVariant.label,
+        volumeMl: displayProduct.selectedVariant.volumeMl ?? null,
+        type: displayProduct.selectedVariant.type || '',
+        effectivePrice: displayProduct.selectedVariant.effectivePrice ?? null,
+        stock: displayProduct.selectedVariant.stock ?? displayProduct.selectedVariant.stockQuantity ?? 0,
+        isAvailable: Boolean(displayProduct.selectedVariant.isAvailable),
+      }
       : null,
     variants: Array.isArray(product.variants)
       ? product.variants.map((variant) => ({
-          id: variant.id,
-          label: variant.label,
-          volumeMl: variant.volumeMl ?? null,
-          type: variant.type || '',
-          effectivePrice: variant.effectivePrice ?? null,
-          stock: variant.stock ?? variant.stockQuantity ?? 0,
-          isAvailable: Boolean(variant.isAvailable),
-        }))
+        id: variant.id,
+        label: variant.label,
+        volumeMl: variant.volumeMl ?? null,
+        type: variant.type || '',
+        effectivePrice: variant.effectivePrice ?? null,
+        stock: variant.stock ?? variant.stockQuantity ?? 0,
+        isAvailable: Boolean(variant.isAvailable),
+      }))
       : [],
   };
 }
@@ -444,9 +444,9 @@ async function buildProductCandidates(question, contextProductId = null) {
       products,
       moreInfo: products.length < 2
         ? {
-            answer: 'Mình chưa tìm đủ 2 sản phẩm trong database để so sánh. Bạn gửi lại tên 2 chai cụ thể hơn nhé.',
-            suggestedQuestions: ['So sánh Dior Sauvage và Bleu de Chanel', 'Tư vấn mùi đi date'],
-          }
+          answer: 'Mình chưa tìm đủ 2 sản phẩm trong database để so sánh. Bạn gửi lại tên 2 chai cụ thể hơn nhé.',
+          suggestedQuestions: ['So sánh Dior Sauvage và Bleu de Chanel', 'Tư vấn mùi đi date'],
+        }
         : null,
     };
   }
@@ -786,6 +786,148 @@ function createChatPayload({
     provider,
   };
 }
+const CHATBOX_IN_SCOPE_TERMS = [
+  'nuoc hoa',
+  'perfume',
+  'mui huong',
+  'mui',
+  'huong',
+  'scent',
+  'chai',
+  'san pham',
+  'thuong hieu',
+  'brand',
+  'decant',
+  'chiet',
+  'mini size',
+  'fullbox',
+  'full box',
+  'ml',
+  'gia',
+  'don hang',
+  'ma don',
+  'giao hang',
+  'van chuyen',
+  'ship',
+  'thanh toan',
+  'momo',
+  'zalopay',
+  'cod',
+  'doi tra',
+  'hoan tien',
+  'chinh hang',
+  'authentic',
+  'hotline',
+  'lien he',
+];
+
+const CHATBOX_OUT_OF_SCOPE_GROUPS = [
+  {
+    key: 'medical',
+    label: 'y tế',
+    terms: [
+      'bac si',
+      'y te',
+      'kham benh',
+      'chan doan',
+      'benh',
+      'trieu chung',
+      'dau dau',
+      'dau bung',
+      'di ung',
+      'phat ban',
+      'kho tho',
+      'uong thuoc',
+      'don thuoc',
+      'thuoc gi',
+      'thuoc nao',
+    ],
+  },
+  {
+    key: 'legal',
+    label: 'pháp luật',
+    terms: [
+      'luat su',
+      'phap luat',
+      'kien tung',
+      'khoi kien',
+      'toi pham',
+      'hop dong',
+      'ly hon',
+    ],
+  },
+  {
+    key: 'finance',
+    label: 'tài chính/đầu tư',
+    terms: [
+      'dau tu',
+      'chung khoan',
+      'co phieu',
+      'coin',
+      'crypto',
+      'bitcoin',
+      'forex',
+      'vay tien',
+      'lai suat',
+      'mua vang',
+    ],
+  },
+];
+
+function includesChatPhrase(text, phrase) {
+  return new RegExp(
+    `(?:^|\\s)${phrase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:\\s|$)`,
+  ).test(text);
+}
+
+function hasAnyChatTerm(text, terms) {
+  return terms.some((term) => includesChatPhrase(text, term));
+}
+
+function detectOutOfScopeGroup(question) {
+  const normalized = normalizeVietnameseText(question);
+  return CHATBOX_OUT_OF_SCOPE_GROUPS.find((group) => hasAnyChatTerm(normalized, group.terms)) || null;
+}
+
+function hasPerfumeStoreContext(question) {
+  const normalized = normalizeVietnameseText(question);
+  return hasAnyChatTerm(normalized, CHATBOX_IN_SCOPE_TERMS);
+}
+
+function buildOutOfScopePayload(group) {
+  return {
+    answer: `Xin lỗi, HuyPerfume chỉ hỗ trợ tư vấn nước hoa, sản phẩm, decant, đơn hàng và chính sách mua hàng. Nội dung bạn hỏi thuộc nhóm ${group.label}, nên mình không tự ý tư vấn chuyên môn. Bạn nên liên hệ chuyên gia phù hợp để được hỗ trợ chính xác. Nếu cần chọn nước hoa theo phong cách, giới tính, ngân sách hoặc dịp sử dụng, mình sẵn sàng hỗ trợ.`,
+    intent: 'out_of_scope',
+    needMoreInfo: false,
+    suggestedQuestions: [
+      'Tư vấn nước hoa cho nam dưới 1 triệu',
+      'Mùi đi học/đi làm nên chọn gì?',
+      'Decant 10ml còn những mùi nào?',
+    ],
+    products: [],
+    actions: [],
+    filters: {},
+    provider: 'scope_guard',
+  };
+}
+
+function buildPerfumeSafetyPayload() {
+  return {
+    answer:
+      'Mình không thể tư vấn y tế hoặc chẩn đoán triệu chứng. Nếu bạn bị đau đầu, dị ứng, khó thở hoặc khó chịu khi dùng nước hoa, bạn nên ngưng sử dụng và liên hệ bác sĩ/cơ sở y tế khi cần. Trong phạm vi HuyPerfume, mình có thể gợi ý các mùi nhẹ, sạch, ít nồng như citrus, fresh, aquatic hoặc musk nhẹ để bạn tham khảo.',
+    intent: 'perfume_safety_limited',
+    needMoreInfo: false,
+    suggestedQuestions: [
+      'Tư vấn mùi nhẹ đi học/đi làm',
+      'Nước hoa fresh dưới 1 triệu',
+      'Decant mùi sạch dễ dùng',
+    ],
+    products: [],
+    actions: [],
+    filters: {},
+    provider: 'scope_guard',
+  };
+}
 
 async function callDeepSeek(messages) {
   const apiKey = cleanText(process.env.DEEPSEEK_API_KEY);
@@ -817,6 +959,25 @@ export async function productChat(req, res) {
   try {
     const question = cleanText(req.body?.q || req.body?.question);
     if (!question) return errorResponse(res, 400, 'Thiếu câu hỏi q');
+
+    const outOfScopeGroup = detectOutOfScopeGroup(question);
+    const hasStoreContext = hasPerfumeStoreContext(question);
+
+    if (outOfScopeGroup && !hasStoreContext) {
+      return successResponse(
+        res,
+        'Chatbot từ chối câu hỏi ngoài phạm vi',
+        buildOutOfScopePayload(outOfScopeGroup),
+      );
+    }
+
+    if (outOfScopeGroup?.key === 'medical') {
+      return successResponse(
+        res,
+        'Chatbot giới hạn tư vấn an toàn',
+        buildPerfumeSafetyPayload(),
+      );
+    }
 
     const contextProductId = Number(req.body?.productId || req.body?.contextProductId) || null;
     const { chatIntent, products, moreInfo } = await buildProductCandidates(question, contextProductId);
